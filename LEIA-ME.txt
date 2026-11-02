@@ -1,0 +1,16 @@
+COMO GERAR O INSTALADOR (PyDM-Setup.exe)
+
+OPCAO A - No seu PC com Windows (mais rapido)
+1. Instale o Python 3.8+ (marque "Add Python to PATH"): https://python.org
+2. Instale o Inno Setup 6: https://jrsoftware.org/isdl.php
+3. De dois cliques em build.bat
+4. O instalador sera criado em: installer\PyDM-Setup.exe
+
+OPCAO B - Sem instalar nada (GitHub Actions)
+1. Crie um repositorio no GitHub e envie todos os arquivos desta pasta
+   (inclusive a pasta .github).
+2. Abra a aba Actions > "Build instalador" e espere terminar.
+3. Baixe o arquivo PyDM-Setup em "Artifacts".
+
+Obs.: o Windows SmartScreen pode avisar "editor desconhecido", pois o
+executavel nao e assinado digitalmente. Clique em "Mais informacoes" > "Executar assim mesmo".
