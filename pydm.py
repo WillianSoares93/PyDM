@@ -7,7 +7,8 @@ PyDM - Gerenciador de downloads estilo IDM
 - Monitor da área de transferência (copiou um link? ele pergunta se quer baixar)
 Requer apenas Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
 """
-import os, re, json, time, threading, subprocess, sys
+import os, re, json, time, threading, subprocess, sys, queue
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.request, urllib.parse
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -44,9 +45,9 @@ def req(url, headers=None):
     return urllib.request.Request(url, headers=h)
 
 
-def probe(url):
+def probe(url, headers=None):
     """Descobre tamanho, suporte a Range e nome do arquivo."""
-    with urllib.request.urlopen(req(url, {"Range": "bytes=0-0"}), timeout=20) as r:
+    with urllib.request.urlopen(req(url, {**(headers or {}), "Range": "bytes=0-0"}), timeout=20) as r:
         cr, cl = r.headers.get("Content-Range"), r.headers.get("Content-Length")
         size, resumable = None, False
         if r.status == 206 and cr:
@@ -81,8 +82,9 @@ def unique_path(folder, name):
 
 
 class Download:
-    def __init__(self, url, folder, conns=8):
+    def __init__(self, url, folder, conns=8, headers=None):
         self.url, self.folder, self.conns = url, folder, conns
+        self.headers = headers or {}
         self.name = self.path = self.size = None
         self.resumable = False
         self.segs = []  # cada segmento: [inicio, fim, posicao_atual]
@@ -95,11 +97,11 @@ class Download:
     # ---------- persistência ----------
     def to_dict(self):
         return {k: getattr(self, k) for k in
-                ("url", "folder", "conns", "name", "path", "size", "resumable", "segs", "status")}
+                ("url", "folder", "conns", "name", "path", "size", "resumable", "segs", "status", "headers")}
 
     @classmethod
     def from_dict(cls, d):
-        o = cls(d["url"], d["folder"], d.get("conns", 8))
+        o = cls(d["url"], d["folder"], d.get("conns", 8), d.get("headers"))
         for k in ("name", "path", "size", "resumable", "segs", "status"):
             setattr(o, k, d.get(k))
         if o.status in ("Baixando", "Na fila"):
@@ -151,7 +153,7 @@ class Download:
             self.failed, self.error, self.status = False, "", "Baixando"
             os.makedirs(self.folder, exist_ok=True)
             if not self.path:
-                self.size, self.resumable, self.name = probe(self.url)
+                self.size, self.resumable, self.name = probe(self.url, self.headers)
                 self.path = unique_path(self.folder, self.name)
             fresh = not os.path.exists(self.part)
             if fresh or not self.segs or not self.resumable:
@@ -185,7 +187,7 @@ class Download:
                     if seg[1] >= 0 and seg[2] > seg[1]:
                         return
                     try:
-                        h = {}
+                        h = dict(self.headers)
                         if self.resumable:
                             h["Range"] = f"bytes={seg[2]}-{seg[1] if seg[1] >= 0 else ''}"
                         with urllib.request.urlopen(req(self.url, h), timeout=20) as r:
@@ -220,6 +222,70 @@ class Download:
             self.error, self.failed = str(ex), True
 
 
+# ---------- ponte com a extensão do navegador ----------
+PORT = 9614
+INBOX = queue.Queue()
+
+
+class Bridge(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _allowed(self):
+        o = self.headers.get("Origin")
+        host_ok = self.headers.get("Host", "") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}")
+        return host_ok and (o is None or o.startswith(("chrome-extension://", "moz-extension://")))
+
+    def _send(self, code, obj=None):
+        body = json.dumps(obj or {}).encode()
+        self.send_response(code)
+        o = self.headers.get("Origin")
+        if o:
+            self.send_header("Access-Control-Allow-Origin", o)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        self._send(200 if self._allowed() else 403)
+
+    def do_GET(self):
+        if not self._allowed():
+            return self._send(403)
+        self._send(200, {"app": "PyDM", "version": 1})
+
+    def do_POST(self):
+        if not self._allowed() or self.path != "/add":
+            return self._send(403)
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            j = json.loads(self.rfile.read(min(n, 65536)))
+            url = str(j["url"]).strip()
+            if not url.lower().startswith(("http://", "https://")):
+                return self._send(400, {"error": "url"})
+            clean = lambda v: re.sub(r"[\r\n]", "", str(v or ""))
+            h = {}
+            for k, key in (("referrer", "Referer"), ("cookie", "Cookie"), ("userAgent", "User-Agent")):
+                if clean(j.get(k)):
+                    h[key] = clean(j.get(k))
+            INBOX.put({"url": url, "headers": h})
+            self._send(200, {"ok": True})
+        except Exception:
+            self._send(400, {"error": "json"})
+
+
+def start_bridge():
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), Bridge)
+    except OSError:
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -251,6 +317,7 @@ class App:
         self.status_bar.pack(fill="x")
 
         self.last_clip = ""
+        self.bridge = start_bridge()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.tick()
         self.watch_clipboard()
@@ -271,8 +338,8 @@ class App:
             pass
 
     # ---------- ações ----------
-    def add(self, url, folder, conns):
-        d = Download(url, folder, conns)
+    def add(self, url, folder, conns, headers=None):
+        d = Download(url, folder, conns, headers)
         self.items.append(d)
         self.save()
 
@@ -366,6 +433,11 @@ class App:
     # ---------- loop da interface ----------
     def tick(self):
         now = time.time()
+        while not INBOX.empty():
+            j = INBOX.get()
+            self.add(j["url"], DEFAULT_FOLDER, 8, j["headers"])
+            self.root.deiconify()
+            self.root.lift()
         active = [d for d in self.items if d.status == "Baixando"]
         for d in self.items:
             if d.status == "Na fila" and len(active) < MAX_ACTIVE:
@@ -394,7 +466,7 @@ class App:
             else:
                 self.tree.insert("", "end", iid=iid, values=row)
         self.status_bar.config(text=f"{len(active)} ativo(s)  |  Velocidade total: {fmt_size(total_speed)}/s  |  "
-                                    f"{len(self.items)} item(ns)")
+                                    f"{len(self.items)} item(ns)  |  Extensão: " + ("ativa" if self.bridge else "porta em uso"))
         if int(now) % 3 == 0:
             self.save()
         self.root.after(500, self.tick)
