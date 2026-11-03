@@ -7,6 +7,10 @@ PyDM - Gerenciador de downloads estilo IDM
 - Monitor da área de transferência (copiou um link? ele pergunta se quer baixar)
 - Janela "Informação do arquivo de download" (categoria, pasta, descrição)
   ao capturar um link pelo navegador, pela área de transferência ou por "Adicionar URL"
+- Janela de progresso ao iniciar (estado, velocidade, tempo restante e progresso por conexão)
+  e janela "Download completo" (Abrir / Abrir com... / Abrir pasta / Fechar)
+- Segmentação dinâmica: quando uma conexão termina, ela "rouba" metade do trecho
+  restante da mais lenta, mantendo todas as conexões ocupadas até o fim
 Requer apenas Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
 """
 
@@ -20,7 +24,8 @@ APP_DIR = os.path.join(os.path.expanduser("~"), ".pydm")
 DB = os.path.join(APP_DIR, "downloads.json")
 CFG = os.path.join(APP_DIR, "settings.json")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-CHUNK = 64 * 1024
+CHUNK = 256 * 1024
+MIN_SPLIT = 1024 * 1024  # só divide um trecho se ainda faltar pelo menos 1 MB nele
 MAX_ACTIVE = 3
 DEFAULT_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
 
@@ -57,6 +62,48 @@ def fmt_time(s):
     h, r = divmod(s, 3600)
     m, s = divmod(r, 60)
     return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
+
+
+def pt(txt):
+    """Formato brasileiro: vírgula como separador decimal."""
+    return txt.replace(".", ",")
+
+
+def fmt_eta(s):
+    """Tempo restante no estilo '23 seg.' / '5 min 03 seg.' / '1 h 02 min'."""
+    if s is None or s < 0 or s > 86400 * 30:
+        return "--"
+    s = int(s)
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    if h:
+        return f"{h} h {m:02d} min"
+    if m:
+        return f"{m} min {sec:02d} seg."
+    return f"{sec} seg."
+
+
+def _untop(win):
+    try:
+        win.attributes("-topmost", False)
+    except tk.TclError:
+        pass
+
+
+def center_front(win, offset=0):
+    """Centraliza a janela e a traz para a frente (o foco costuma estar no navegador)."""
+    try:
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2 + offset
+        y = (win.winfo_screenheight() - win.winfo_reqheight()) // 3 + offset
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.deiconify()
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(400, lambda: _untop(win))
+        win.focus_force()
+    except tk.TclError:
+        pass
 
 
 def req(url, headers=None):
@@ -104,7 +151,7 @@ def unique_path(folder, name):
 # ---------- configurações (categorias, pastas recentes) ----------
 
 def load_cfg():
-    s = {"categories": copy.deepcopy(DEFAULT_CATEGORIES), "recent": [], "conns": 8}
+    s = {"categories": copy.deepcopy(DEFAULT_CATEGORIES), "recent": [], "conns": 8, "show_complete": True}
     try:
         with open(CFG, encoding="utf-8") as f:
             j = json.load(f)
@@ -121,6 +168,7 @@ def load_cfg():
         c = j.get("conns")
         if isinstance(c, int) and 1 <= c <= 32:
             s["conns"] = c
+        s["show_complete"] = bool(j.get("show_complete", True))
     except Exception:
         pass
     return s
@@ -166,6 +214,9 @@ class Download:
         self.stop = threading.Event()
         self.thread = None
         self.failed = False
+        self.lock = threading.Lock()   # protege a divisão dinâmica de segmentos
+        self.seg_state = {}            # id(segmento) -> texto da coluna "Informações"
+        self.announce = False          # True = mostrar a janela "Download completo" ao terminar
         self.speed, self._last = 0.0, (time.time(), 0)
 
     # ---------- persistência ----------
@@ -198,10 +249,26 @@ class Download:
             t += (p - s) if e < 0 else max(0, min(p, e + 1) - s)
         return t
 
+    def seg_rows(self):
+        """Linhas da tabela de conexões: (nº, bytes baixados, informação)."""
+        rows = []
+        for i, seg in enumerate(sorted(list(self.segs), key=lambda x: x[0]), 1):
+            s, e, p = seg
+            got = (p - s) if e < 0 else max(0, min(p, e + 1) - s)
+            if self.status == "Concluído" or (e >= 0 and p > e):
+                info = "Concluído"
+            elif self.status != "Baixando":
+                info = self.status
+            else:
+                info = self.seg_state.get(id(seg), "Conectando...")
+            rows.append((i, got, info))
+        return rows
+
     # ---------- controle ----------
     def start(self):
         if self.thread and self.thread.is_alive():
             return
+        self.announce = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -244,9 +311,11 @@ class Download:
                 with open(self.part, "wb") as f:
                     if self.size:
                         f.truncate(self.size)
+            self.seg_state = {}
             threads = []
-            for seg in self.segs:
+            for seg in list(self.segs):
                 if seg[1] < 0 or seg[2] <= seg[1]:
+                    self.seg_state[id(seg)] = "Conectando..."
                     t = threading.Thread(target=self._worker, args=(seg,), daemon=True)
                     t.start()
                     threads.append(t)
@@ -262,47 +331,91 @@ class Download:
         except Exception as ex:
             self.error, self.status = str(ex), "Erro"
 
+    def _steal(self):
+        """Segmentação dinâmica: pega a metade final do maior trecho ainda não baixado.
+        Assim, quando uma conexão termina, ela ajuda as mais lentas em vez de ficar parada."""
+        if not self.resumable or not self.size:
+            return None
+        with self.lock:
+            best, rem = None, 0
+            for s in self.segs:
+                if s[1] >= 0 and s[1] + 1 - s[2] > rem:
+                    best, rem = s, s[1] + 1 - s[2]
+            if best is None or rem < MIN_SPLIT:
+                return None
+            mid = best[1] + 1 - rem // 2
+            new = [mid, best[1], mid]
+            best[1] = mid - 1          # a conexão antiga para sozinha ao chegar aqui
+            self.segs.append(new)
+            self.seg_state[id(new)] = "Conectando..."
+            return new
+
     def _worker(self, seg):
-        tries = 0
         try:
-            with open(self.part, "r+b") as f:
-                while not self.stop.is_set() and not self.failed:
-                    if seg[1] >= 0 and seg[2] > seg[1]:
-                        return
-                    try:
-                        h = dict(self.headers)
-                        if self.resumable:
-                            h["Range"] = f"bytes={seg[2]}-{seg[1] if seg[1] >= 0 else ''}"
-                        with urllib.request.urlopen(req(self.url, h), timeout=20) as r:
-                            if self.resumable and r.status != 206:
-                                raise IOError("Servidor ignorou o pedido de Range")
-                            f.seek(seg[2])
-                            while not self.stop.is_set():
-                                buf = r.read(CHUNK)
-                                if not buf:
-                                    break
-                                if seg[1] >= 0:
-                                    buf = buf[: seg[1] + 1 - seg[2]]
-                                f.write(buf)
-                                seg[2] += len(buf)
-                                tries = 0
-                                if seg[1] >= 0 and seg[2] > seg[1]:
-                                    return
-                            if self.stop.is_set():
-                                return
-                            if seg[1] < 0:
-                                return  # tamanho desconhecido: EOF = fim
-                            raise IOError("Conexão encerrada antes do fim")
-                    except Exception as ex:
-                        tries += 1
-                        if tries > 6:
-                            self.error, self.failed = str(ex), True
-                            return
-                        if not self.resumable:
-                            seg[2] = seg[0]
-                        time.sleep(min(2 * tries, 10))
+            while self._download_seg(seg):
+                if self.stop.is_set() or self.failed:
+                    return
+                seg = self._steal()
+                if seg is None:
+                    return
         except Exception as ex:
             self.error, self.failed = str(ex), True
+
+    def _download_seg(self, seg):
+        """Baixa um segmento. Retorna True se ele foi concluído; False se parou (pausa/erro)."""
+        tries = 0
+        st = self.seg_state
+        with open(self.part, "r+b") as f:
+            while not self.stop.is_set() and not self.failed:
+                if seg[1] >= 0 and seg[2] > seg[1]:
+                    st[id(seg)] = "Concluído"
+                    return True
+                try:
+                    st[id(seg)] = "Conectando..."
+                    h = dict(self.headers)
+                    if self.resumable:
+                        h["Range"] = f"bytes={seg[2]}-{seg[1] if seg[1] >= 0 else ''}"
+                    with urllib.request.urlopen(req(self.url, h), timeout=20) as r:
+                        if self.resumable and r.status != 206:
+                            raise IOError("Servidor ignorou o pedido de Range")
+                        st[id(seg)] = "Recebendo..."
+                        f.seek(seg[2])
+                        read = getattr(r, "read1", r.read)  # read1 não espera encher o buffer
+                        while not self.stop.is_set():
+                            buf = read(CHUNK)
+                            if not buf:
+                                break
+                            if seg[1] >= 0:
+                                n = seg[1] + 1 - seg[2]   # o fim pode ter encurtado (segmentação dinâmica)
+                                if n <= 0:
+                                    st[id(seg)] = "Concluído"
+                                    return True
+                                buf = buf[:n]
+                            f.write(buf)
+                            f.flush()   # o que está no JSON de progresso já está de fato no disco
+                            seg[2] += len(buf)
+                            tries = 0
+                            if seg[1] >= 0 and seg[2] > seg[1]:
+                                st[id(seg)] = "Concluído"
+                                return True
+                        if self.stop.is_set():
+                            st[id(seg)] = "Pausado"
+                            return False
+                        if seg[1] < 0:
+                            st[id(seg)] = "Concluído"
+                            return True  # tamanho desconhecido: EOF = fim
+                        raise IOError("Conexão encerrada antes do fim")
+                except Exception as ex:
+                    tries += 1
+                    st[id(seg)] = f"Reconectando ({tries})..."
+                    if tries > 6:
+                        self.error, self.failed = str(ex), True
+                        st[id(seg)] = "Erro"
+                        return False
+                    if not self.resumable:
+                        seg[2] = seg[0]
+                    time.sleep(min(2 * tries, 10))
+        return False
 
 
 # ---------- ponte com a extensão do navegador ----------
@@ -612,14 +725,253 @@ class InfoDialog:
         self.win.destroy()
 
 
+class ProgressDialog:
+    """Janela de progresso do download (estilo IDM): estado, tamanho, velocidade, tempo restante,
+    barra de progresso e, em "detalhes", a posição e o progresso de cada conexão.
+    Fechar a janela NÃO cancela o download: ele continua em segundo plano."""
+
+    def __init__(self, app, d):
+        self.app, self.d = app, d
+        self.job = None
+        self.details = True
+        win = self.win = tk.Toplevel(app.root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        win.bind("<Escape>", lambda e: self.close())
+        f = ttk.Frame(win, padding=10)
+        f.pack(fill="both", expand=True)
+
+        box = tk.Frame(f, bg="white", bd=1, relief="solid", padx=10, pady=8)
+        box.pack(fill="x")
+        box.columnconfigure(0, minsize=200)
+        box.columnconfigure(1, weight=1)
+        self.v = {k: tk.StringVar() for k in ("url", "estado", "tamanho", "baixado", "vel", "eta", "cap")}
+        tk.Label(box, textvariable=self.v["url"], bg="white", anchor="w", width=76).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(box, text="Estado:", bg="white", anchor="w").grid(row=1, column=0, sticky="w", pady=(4, 10))
+        self.estado_lbl = tk.Label(box, textvariable=self.v["estado"], bg="white", fg="#0033cc", anchor="w")
+        self.estado_lbl.grid(row=1, column=1, sticky="w", pady=(4, 10))
+        for i, (txt, key) in enumerate((("Tamanho", "tamanho"), ("Baixando", "baixado"),
+                                        ("Velocidade", "vel"), ("Tempo restante", "eta"),
+                                        ("Capacidade de continuar", "cap")), start=2):
+            tk.Label(box, text=txt, bg="white", anchor="w").grid(row=i, column=0, sticky="w")
+            tk.Label(box, textvariable=self.v[key], bg="white", anchor="w").grid(row=i, column=1, sticky="w")
+
+        self.bar = ttk.Progressbar(f, maximum=100)
+        self.bar.pack(fill="x", pady=10)
+
+        bf = ttk.Frame(f)
+        bf.pack(fill="x", pady=(0, 6))
+        self.btn_det = ttk.Button(bf, text="<< Ocultar detalhes", command=self.toggle_details)
+        self.btn_det.pack(side="left")
+        ttk.Button(bf, text="Cancelar", width=12, command=self.cancel).pack(side="right")
+        self.btn_pause = ttk.Button(bf, text="Pausar", width=12, command=self.toggle_pause)
+        self.btn_pause.pack(side="right", padx=8)
+
+        self.det = ttk.Frame(f)
+        self.det.pack(fill="both", expand=True)
+        ttk.Label(self.det, text="Posição de início e progresso do download por conexões").pack()
+        self.map = tk.Canvas(self.det, height=14, bg="#e6e6e6", highlightthickness=1,
+                             highlightbackground="#9a9a9a")
+        self.map.pack(fill="x", pady=(4, 8))
+        tf = ttk.Frame(self.det)
+        tf.pack(fill="both", expand=True)
+        self.tbl = ttk.Treeview(tf, columns=("n", "baixado", "info"), show="headings", height=7)
+        for c, t, w in (("n", "N.", 40), ("baixado", "Baixado", 120), ("info", "Informações", 330)):
+            self.tbl.heading(c, text=t)
+            self.tbl.column(c, width=w, anchor="w")
+        sb = ttk.Scrollbar(tf, orient="vertical", command=self.tbl.yview)
+        self.tbl.configure(yscrollcommand=sb.set)
+        self.tbl.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        self.refresh()
+        center_front(win, offset=26 * (len(app.progress) % 6))
+
+    # ---------- botões ----------
+    def toggle_details(self):
+        if self.details:
+            self.det.pack_forget()
+            self.btn_det.configure(text="Mostrar detalhes >>")
+        else:
+            self.det.pack(fill="both", expand=True)
+            self.btn_det.configure(text="<< Ocultar detalhes")
+        self.details = not self.details
+
+    def toggle_pause(self):
+        d = self.d
+        if d.status == "Baixando":
+            d.pause()
+        elif d.status == "Na fila":
+            d.status = "Pausado"
+        elif d.status in ("Pausado", "Erro"):
+            d.status = "Na fila"
+
+    def cancel(self):
+        if messagebox.askyesno("Cancelar download",
+                               "Cancelar e remover este download da lista?\n"
+                               "(O arquivo incompleto será apagado.)", parent=self.win):
+            self.app.remove_items([self.d])
+
+    def close(self):
+        if self.job:
+            try:
+                self.win.after_cancel(self.job)
+            except tk.TclError:
+                pass
+            self.job = None
+        self.app.progress.pop(id(self.d), None)
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+    # ---------- atualização periódica ----------
+    def draw_map(self):
+        c, d = self.map, self.d
+        c.delete("all")
+        if not d.size:
+            return
+        w = max(c.winfo_width(), 100)
+        for s, e, p in list(d.segs):
+            if e < 0:
+                continue
+            x0 = s * w / d.size
+            x1 = (s + max(0, min(p, e + 1) - s)) * w / d.size
+            if x1 > x0:
+                c.create_rectangle(x0, 1, x1, 15, fill="#1d4ed8", width=0)
+            c.create_line(x0, 0, x0, 16, fill="#666666")
+
+    def refresh(self):
+        d = self.d
+        dl, st = d.downloaded, d.status
+        pct = dl * 100 / d.size if d.size else None
+        self.win.title((f"{pct:.0f}% " if pct is not None else "") + (d.name or guess_name(d.url)))
+        self.v["url"].set(d.url)
+        if st == "Baixando":
+            estado = "Recebendo..." if dl > 0 else "Conectando..."
+        elif st == "Na fila":
+            estado = "Na fila..."
+        elif st == "Erro":
+            estado = "Erro: " + (d.error or "falha no download")[:70]
+        else:
+            estado = st
+        self.v["estado"].set(estado)
+        self.estado_lbl.configure(fg="#cc0000" if st == "Erro" else "#0033cc")
+        self.v["tamanho"].set(pt(fmt_size(d.size, 3)) if d.size else "Desconhecido")
+        self.v["baixado"].set(pt(fmt_size(dl, 3)) + (pt(f" ( {pct:.2f} % )") if pct is not None else ""))
+        self.v["vel"].set(pt(fmt_size(d.speed, 3)) + "/seg" if d.speed else "")
+        self.v["eta"].set(fmt_eta((d.size - dl) / d.speed) if d.size and d.speed > 1 else "--")
+        self.v["cap"].set(("Sim" if d.resumable else "Não") if d.probed else "--")
+        self.bar["value"] = pct or 0
+        self.btn_pause.configure(text="Pausar" if st in ("Baixando", "Na fila") else "Iniciar",
+                                 state="disabled" if st == "Concluído" else "normal")
+        if self.details:
+            self.draw_map()
+            for n, got, info in d.seg_rows():
+                vals = (n, pt(fmt_size(got, 3)), info)
+                iid = str(n - 1)
+                if self.tbl.exists(iid):
+                    self.tbl.item(iid, values=vals)
+                else:
+                    self.tbl.insert("", "end", iid=iid, values=vals)
+        self.job = self.win.after(300, self.refresh)
+
+
+class CompleteDialog:
+    """Janela "Download completo": Abrir / Abrir com... / Abrir pasta / Fechar."""
+
+    def __init__(self, app, d):
+        self.app, self.d = app, d
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Download completo")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        win.bind("<Escape>", lambda e: self.close())
+        try:
+            size = os.path.getsize(d.path)
+        except OSError:
+            size = d.size or 0
+        self.url_var = tk.StringVar(value=d.url)    # precisam ficar em self, senão o Tk apaga o texto
+        self.path_var = tk.StringVar(value=d.path)
+        self.mute = tk.BooleanVar(value=False)
+
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        top = ttk.Frame(f)
+        top.pack(fill="x")
+        try:
+            bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+        except tk.TclError:
+            bg = "#f0f0f0"
+        ic = tk.Canvas(top, width=54, height=66, highlightthickness=0, bd=0, bg=bg)
+        ic.pack(side="left")
+        ic.create_polygon(8, 4, 34, 4, 46, 16, 46, 62, 8, 62, fill="white", outline="#8a8a8a")
+        ic.create_polygon(34, 4, 34, 16, 46, 16, fill="#e4e4e4", outline="#8a8a8a")
+        ic.create_oval(26, 42, 50, 66, fill="#2e9e44", outline="white", width=2)
+        ic.create_text(38, 54, text="\u2713", fill="white", font=("Segoe UI", 11, "bold"))
+        tx = ttk.Frame(top)
+        tx.pack(side="left", padx=12)
+        ttk.Label(tx, text="Download completo", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(tx, text=f"Baixado {pt(fmt_size(size, 2))} ({size} Bytes)").pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(f, text="Endereço:").pack(anchor="w", pady=(12, 2))
+        ttk.Entry(f, state="readonly", textvariable=self.url_var, width=70).pack(fill="x")
+        ttk.Label(f, text="O arquivo foi salvo como:").pack(anchor="w", pady=(10, 2))
+        ttk.Entry(f, state="readonly", textvariable=self.path_var).pack(fill="x")
+
+        bf = ttk.Frame(f)
+        bf.pack(pady=(14, 8))
+        for txt, cmd in (("Abrir", self.open), ("Abrir com...", self.open_with),
+                         ("Abrir pasta", self.open_folder), ("Fechar", self.close)):
+            ttk.Button(bf, text=txt, width=14, command=cmd).pack(side="left", padx=4)
+        ttk.Checkbutton(f, text="Não mostrar esta mensagem na próxima vez",
+                        variable=self.mute).pack(anchor="w")
+        center_front(win)
+
+    def open(self):
+        App._open(self.d.path)
+        self.close()
+
+    def open_with(self):
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", self.d.path])
+            else:
+                App._open(self.d.path)
+        except Exception:
+            pass
+        self.close()
+
+    def open_folder(self):
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["explorer", f"/select,{os.path.normpath(self.d.path)}"])
+            else:
+                App._open(os.path.dirname(self.d.path))
+        except Exception:
+            pass
+        self.close()
+
+    def close(self):
+        if self.mute.get():
+            self.app.notify_var.set(False)
+            self.app.save_notify()
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title("PyDM - Gerenciador de Downloads")
-        root.geometry("980x440")
+        root.geometry("1100x440")
         os.makedirs(APP_DIR, exist_ok=True)
         self.settings = load_cfg()
         self.items = []
+        self.progress = {}   # id(download) -> ProgressDialog aberto
         self.load()
 
         bar = ttk.Frame(root, padding=6)
@@ -628,9 +980,18 @@ class App:
                          ("⏸ Pausar", self.pause_sel), ("🗑 Remover", self.remove_sel),
                          ("📂 Abrir pasta", self.open_folder)):
             ttk.Button(bar, text=txt, command=cmd).pack(side="left", padx=2)
+        self.conns_var = tk.IntVar(value=self.settings["conns"])
+        ttk.Label(bar, text="Conexões:").pack(side="left", padx=(14, 2))
+        sp = ttk.Spinbox(bar, from_=1, to=32, width=4, textvariable=self.conns_var, command=self.save_conns)
+        sp.pack(side="left")
+        sp.bind("<FocusOut>", self.save_conns)
+        sp.bind("<Return>", self.save_conns)
         self.clip_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(bar, text="Monitorar área de transferência",
                         variable=self.clip_var).pack(side="right")
+        self.notify_var = tk.BooleanVar(value=self.settings.get("show_complete", True))
+        ttk.Checkbutton(bar, text="Avisar ao concluir", variable=self.notify_var,
+                        command=self.save_notify).pack(side="right", padx=(0, 10))
 
         cols = ("nome", "tamanho", "progresso", "velocidade", "eta", "status", "descricao")
         self.tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
@@ -778,20 +1139,64 @@ class App:
         if not messagebox.askyesno("Remover", f"Remover {len(sel)} item(ns) da lista?\n"
                                               "(Arquivos incompletos serão apagados; os concluídos são mantidos.)"):
             return
+        self.remove_items(sel)
+
+    def remove_items(self, sel):
         for d in sel:
+            dlg = self.progress.get(id(d))
+            if dlg:
+                dlg.close()
             d.cancel()
-            self.items.remove(d)
-            self.tree.delete(str(id(d)))
+            if d in self.items:
+                self.items.remove(d)
+            if self.tree.exists(str(id(d))):
+                self.tree.delete(str(id(d)))
         self.save()
+
+    def open_progress(self, d):
+        dlg = self.progress.get(id(d))
+        if dlg:
+            try:
+                if dlg.win.winfo_exists():
+                    dlg.win.deiconify()
+                    dlg.win.lift()
+                    return
+            except tk.TclError:
+                pass
+        self.progress[id(d)] = ProgressDialog(self, d)
+
+    def finished(self, d):
+        dlg = self.progress.get(id(d))
+        if dlg:
+            dlg.close()
+        if self.notify_var.get():
+            CompleteDialog(self, d)
+
+    def save_notify(self):
+        self.settings["show_complete"] = bool(self.notify_var.get())
+        save_cfg(self.settings)
+
+    def save_conns(self, _e=None):
+        try:
+            n = int(self.conns_var.get())
+        except (tk.TclError, ValueError):
+            n = self.settings["conns"]
+        n = max(1, min(32, n))
+        self.conns_var.set(n)
+        self.settings["conns"] = n   # vale para os próximos downloads
+        save_cfg(self.settings)
 
     def open_folder(self):
         sel = self.selected()
         self._open(sel[0].folder if sel else DEFAULT_FOLDER)
 
     def open_file(self):
+        """Duplo clique: abre o arquivo concluído; nos demais, abre a janela de progresso."""
         for d in self.selected():
             if d.status == "Concluído":
                 self._open(d.path)
+            else:
+                self.open_progress(d)
 
     @staticmethod
     def _open(path):
@@ -820,8 +1225,12 @@ class App:
             if d.status == "Na fila" and len(active) < MAX_ACTIVE:
                 d.start()
                 active.append(d)
+                self.open_progress(d)   # janela de progresso ao iniciar
         total_speed = 0
         for d in self.items:
+            if d.status == "Concluído" and d.announce:
+                d.announce = False
+                self.finished(d)        # janela "Download completo"
             iid = str(id(d))
             dl = d.downloaded
             if d.status == "Baixando":
