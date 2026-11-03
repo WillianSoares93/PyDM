@@ -13,7 +13,11 @@ PyDM - Gerenciador de downloads estilo IDM
 - Aba "Opções ao concluir" (mensagem, desconectar modem, sair do PyDM, desligar/reiniciar/hibernar/suspender)
 - Segmentação dinâmica: quando uma conexão termina, ela "rouba" metade do trecho
   restante da mais lenta, mantendo todas as conexões ocupadas até o fim
-Requer apenas Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
+- Ao fechar a janela o PyDM continua na bandeja do sistema (botão direito no ícone > Sair para encerrar)
+- Instância única: abrir o PyDM de novo só traz a janela existente de volta
+Requer Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
+Opcional: "pip install pystray pillow" habilita o ícone da bandeja. Sem eles, fechar a janela
+encerra o programa, como antes.
 """
 
 import os, re, json, time, threading, subprocess, sys, queue, copy
@@ -467,6 +471,7 @@ class Download:
 # ---------- ponte com a extensão do navegador ----------
 PORT = 9614
 INBOX = queue.Queue()
+TRAY_EVENTS = queue.Queue()  # eventos do menu da bandeja (vêm de outra thread)
 
 
 class Bridge(BaseHTTPRequestHandler):
@@ -500,7 +505,12 @@ class Bridge(BaseHTTPRequestHandler):
         self._send(200, {"app": "PyDM", "version": 1})
 
     def do_POST(self):
-        if not self._allowed() or self.path != "/add":
+        if not self._allowed():
+            return self._send(403)
+        if self.path == "/show":   # outra instância do PyDM pedindo para trazer esta janela de volta
+            INBOX.put({"show": True})
+            return self._send(200, {"ok": True, "app": "PyDM"})
+        if self.path != "/add":
             return self._send(403)
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -526,6 +536,28 @@ def start_bridge():
         return None
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
+
+
+def already_running():
+    """True se já existe um PyDM rodando (e, nesse caso, pede para ele mostrar a janela)."""
+    try:
+        r = urllib.request.Request(f"http://127.0.0.1:{PORT}/show", data=b"{}", method="POST",
+                                   headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(r, timeout=1.5) as resp:
+            return json.loads(resp.read()).get("app") == "PyDM"
+    except Exception:
+        return False
+
+
+def make_tray_image():
+    """Ícone da bandeja: quadrado azul com uma seta de download (desenhado com o Pillow)."""
+    from PIL import Image, ImageDraw
+    im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    dr = ImageDraw.Draw(im)
+    dr.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(29, 78, 216, 255))
+    dr.polygon([(27, 12), (37, 12), (37, 29), (46, 29), (32, 45), (18, 29), (27, 29)], fill="white")
+    dr.rectangle((16, 50, 48, 54), fill="white")
+    return im
 
 
 # ---------- janela "Informação do arquivo de download" ----------
@@ -1223,8 +1255,12 @@ class App:
         self.last_clip = ""
         self.bridge = start_bridge()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.tray, self.tray_notified = None, False
+        self._tray_text, self._tray_t = "", 0.0
+        self.start_tray()
         self.tick()
         self.watch_clipboard()
+        self.poll_tray()
 
     # ---------- persistência ----------
     def load(self):
@@ -1403,7 +1439,7 @@ class App:
             ShutdownCountdown(self, sd["mode"], sd["force"])
             return False
         if any(a["quit"] for a in acts):
-            self.on_close()
+            self.quit_app()
             return True
         return False
 
@@ -1450,6 +1486,9 @@ class App:
         now = time.time()
         while not INBOX.empty():
             j = INBOX.get()
+            if j.get("show"):   # segunda instância pediu para mostrar a janela
+                self.show_window()
+                continue
             try:
                 self.open_info(j["url"], j["headers"])
             except Exception:
@@ -1495,6 +1534,7 @@ class App:
         self.status_bar.config(text=f"{len(active)} ativo(s) | Velocidade total: {fmt_size(total_speed)}/s | "
                                     f"{len(self.items)} item(ns) | Extensão: " +
                                     ("ativa" if self.bridge else "porta em uso"))
+        self.update_tray_title(len(active), total_speed)
         if self.pending_done and not any(x.status in ("Baixando", "Na fila") for x in self.items):
             acts, self.pending_done = self.pending_done, []
             if self.run_done_actions(acts):
@@ -1516,7 +1556,96 @@ class App:
                         self.open_info(c)
         self.root.after(1000, self.watch_clipboard)
 
+    # ---------- bandeja do sistema ----------
+    def start_tray(self):
+        """Cria o ícone da bandeja. Se pystray/Pillow não existirem (ou o sistema não suportar),
+        self.tray fica None e fechar a janela encerra o programa, como antes."""
+        if sys.platform == "darwin":   # no macOS o pystray briga com o laço de eventos do Tk
+            return
+        try:
+            import pystray
+            menu = pystray.Menu(
+                pystray.MenuItem("Abrir PyDM", lambda icon, item: TRAY_EVENTS.put("show"), default=True),
+                pystray.MenuItem("Sair", lambda icon, item: TRAY_EVENTS.put("quit")))
+            self.tray = pystray.Icon("PyDM", make_tray_image(), "PyDM", menu)
+            self.tray.run_detached()
+        except Exception:
+            self.tray = None
+
+    def poll_tray(self):
+        """O menu da bandeja roda em outra thread; o Tk só pode ser tocado por esta (a principal)."""
+        while True:
+            try:
+                ev = TRAY_EVENTS.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if ev == "show":
+                    self.show_window()
+                elif ev == "quit":
+                    self.request_quit()
+            except Exception:
+                pass
+        try:
+            self.root.after(150, self.poll_tray)
+        except tk.TclError:
+            pass
+
+    def update_tray_title(self, n, speed):
+        if not self.tray or time.time() - self._tray_t < 2:
+            return
+        self._tray_t = time.time()
+        txt = f"PyDM - {n} ativo(s) - {fmt_size(speed)}/s" if n else "PyDM"
+        if txt != self._tray_text:
+            self._tray_text = txt
+            try:
+                self.tray.title = txt
+            except Exception:
+                pass
+
+    def show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        try:
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def hide_to_tray(self):
+        self.root.withdraw()
+        if not self.tray_notified:   # avisa uma única vez por sessão
+            self.tray_notified = True
+            try:
+                self.tray.notify("O PyDM continua em execução na bandeja do sistema.\n"
+                                 "Clique com o botão direito no ícone e escolha Sair para fechar.", "PyDM")
+            except Exception:
+                pass
+
     def on_close(self):
+        """Botão X da janela: esconde na bandeja (ou encerra, se não houver bandeja)."""
+        if self.tray:
+            self.hide_to_tray()
+        else:
+            self.quit_app()
+
+    def request_quit(self):
+        """"Sair" do menu da bandeja: pede confirmação se houver downloads em andamento."""
+        n = sum(1 for d in self.items if d.status in ("Baixando", "Na fila"))
+        if n:
+            self.show_window()
+            if not messagebox.askyesno("Sair do PyDM",
+                                       f"Há {n} download(s) em andamento.\n"
+                                       "Se sair agora, eles serão pausados (você pode retomar depois).\n\n"
+                                       "Sair mesmo assim?", parent=self.root):
+                return
+        self.quit_app()
+
+    def quit_app(self):
+        """Encerra de verdade: pausa os downloads, salva a lista e remove o ícone da bandeja."""
+        if self.tray:   # remove o ícone sem travar a interface (espera no máximo 2 s)
+            t = threading.Thread(target=self.tray.stop, daemon=True)
+            t.start()
+            t.join(2)
         for d in self.items:
             if d.status == "Baixando":
                 d.pause()
@@ -1528,6 +1657,9 @@ class App:
 
 
 if __name__ == "__main__":
+    if already_running():   # já existe um PyDM (provavelmente na bandeja): ele mostra a janela
+        sys.exit(0)
     root = tk.Tk()
     App(root)
     root.mainloop()
+    os._exit(0)   # a lista já foi salva em quit_app; garante que nenhuma thread da bandeja segure o processo
