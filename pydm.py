@@ -9,6 +9,8 @@ PyDM - Gerenciador de downloads estilo IDM
   ao capturar um link pelo navegador, pela área de transferência ou por "Adicionar URL"
 - Janela de progresso ao iniciar (estado, velocidade, tempo restante e progresso por conexão)
   e janela "Download completo" (Abrir / Abrir com... / Abrir pasta / Fechar)
+- Aba "Limitar velocidade" (limite em KB/s, ajustável durante o download)
+- Aba "Opções ao concluir" (mensagem, desconectar modem, sair do PyDM, desligar/reiniciar/hibernar/suspender)
 - Segmentação dinâmica: quando uma conexão termina, ela "rouba" metade do trecho
   restante da mais lenta, mantendo todas as conexões ocupadas até o fim
 Requer apenas Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
@@ -27,6 +29,8 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 
 CHUNK = 256 * 1024
 MIN_SPLIT = 1024 * 1024  # só divide um trecho se ainda faltar pelo menos 1 MB nele
 MAX_ACTIVE = 3
+NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # evita piscar um console ao chamar comandos no Windows
+DONE_MODES = ("Desligar", "Hibernar", "Em espera", "Reiniciar")
 DEFAULT_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
 
 # Categorias padrão (iguais às do IDM). O usuário pode criar outras pelo botão "+".
@@ -217,13 +221,23 @@ class Download:
         self.lock = threading.Lock()   # protege a divisão dinâmica de segmentos
         self.seg_state = {}            # id(segmento) -> texto da coluna "Informações"
         self.announce = False          # True = mostrar a janela "Download completo" ao terminar
+        self.limit_kbps = 0            # limite de velocidade (KB/s); 0 = sem limite
+        self.limit_remember = False    # guardar o limite no arquivo de downloads?
+        self.tlock = threading.Lock()
+        self._next = 0.0               # instante (monotonic) em que o limitador libera os próximos bytes
+        self.show_msg = None           # None = segue a opção global "Avisar ao concluir"
+        # ações ao concluir (valem só nesta sessão, de propósito: ninguém quer o PC desligando dias depois)
+        self.on_done = {"modem": False, "quit": False, "shutdown": False, "mode": "Desligar", "force": False}
         self.speed, self._last = 0.0, (time.time(), 0)
 
     # ---------- persistência ----------
     def to_dict(self):
-        return {k: getattr(self, k) for k in
-                ("url", "folder", "conns", "name", "path", "size", "resumable", "segs", "status",
-                 "headers", "probed", "description", "category")}
+        j = {k: getattr(self, k) for k in
+             ("url", "folder", "conns", "name", "path", "size", "resumable", "segs", "status",
+              "headers", "probed", "description", "category", "show_msg", "limit_remember")}
+        # o limite só é guardado se o usuário marcou "Lembrar configurações de velocidade"
+        j["limit_kbps"] = self.limit_kbps if self.limit_remember else 0
+        return j
 
     @classmethod
     def from_dict(cls, d):
@@ -234,6 +248,12 @@ class Download:
         o.probed = d.get("probed", bool(d.get("path")))
         o.description = d.get("description") or ""
         o.category = d.get("category") or ""
+        o.show_msg = d.get("show_msg") if isinstance(d.get("show_msg"), bool) else None
+        o.limit_remember = bool(d.get("limit_remember"))
+        try:
+            o.limit_kbps = max(0, int(d.get("limit_kbps") or 0)) if o.limit_remember else 0
+        except (TypeError, ValueError):
+            o.limit_kbps = 0
         if o.status in ("Baixando", "Na fila"):
             o.status = "Pausado"
         return o
@@ -331,6 +351,31 @@ class Download:
         except Exception as ex:
             self.error, self.status = str(ex), "Erro"
 
+    def set_limit(self, kbps, remember=False):
+        """Define o limite de velocidade (KB/s, 0 = ilimitado). Vale para todas as conexões juntas
+        e pode ser mudado com o download em andamento."""
+        self.limit_kbps, self.limit_remember = max(0, int(kbps)), bool(remember)
+        with self.tlock:
+            self._next = 0.0
+
+    def _read_size(self):
+        lim = self.limit_kbps * 1024
+        return CHUNK if lim <= 0 else max(2048, min(CHUNK, lim // 8))  # blocos pequenos = limite mais suave
+
+    def _throttle(self, n):
+        """Freio compartilhado: cada bloco lido "reserva" n/limite segundos na linha do tempo comum."""
+        lim = self.limit_kbps * 1024
+        if lim <= 0:
+            return
+        with self.tlock:
+            now = time.monotonic()
+            self._next = max(self._next, now) + n / lim
+            delay = self._next - now
+        while delay > 0 and not self.stop.is_set():
+            s = min(delay, 0.2)
+            time.sleep(s)
+            delay -= s
+
     def _steal(self):
         """Segmentação dinâmica: pega a metade final do maior trecho ainda não baixado.
         Assim, quando uma conexão termina, ela ajuda as mais lentas em vez de ficar parada."""
@@ -382,7 +427,7 @@ class Download:
                         f.seek(seg[2])
                         read = getattr(r, "read1", r.read)  # read1 não espera encher o buffer
                         while not self.stop.is_set():
-                            buf = read(CHUNK)
+                            buf = read(self._read_size())
                             if not buf:
                                 break
                             if seg[1] >= 0:
@@ -395,6 +440,7 @@ class Download:
                             f.flush()   # o que está no JSON de progresso já está de fato no disco
                             seg[2] += len(buf)
                             tries = 0
+                            self._throttle(len(buf))
                             if seg[1] >= 0 and seg[2] > seg[1]:
                                 st[id(seg)] = "Concluído"
                                 return True
@@ -725,6 +771,67 @@ class InfoDialog:
         self.win.destroy()
 
 
+def power_action(mode, force=False):
+    """Desliga, reinicia, hiberna ou suspende o computador."""
+    try:
+        if sys.platform.startswith("win"):
+            f = ["/f"] if force else []
+            cmds = {"Desligar": ["shutdown", "/s", "/t", "0"] + f,
+                    "Reiniciar": ["shutdown", "/r", "/t", "0"] + f,
+                    "Hibernar": ["shutdown", "/h"],
+                    "Em espera": ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]}
+        elif sys.platform == "darwin":
+            cmds = {"Desligar": ["osascript", "-e", 'tell app "System Events" to shut down'],
+                    "Reiniciar": ["osascript", "-e", 'tell app "System Events" to restart'],
+                    "Hibernar": ["pmset", "sleepnow"], "Em espera": ["pmset", "sleepnow"]}
+        else:
+            cmds = {"Desligar": ["systemctl", "poweroff"], "Reiniciar": ["systemctl", "reboot"],
+                    "Hibernar": ["systemctl", "hibernate"], "Em espera": ["systemctl", "suspend"]}
+        subprocess.Popen(cmds[mode], creationflags=NOWIN)
+    except Exception:
+        pass
+
+
+class ShutdownCountdown:
+    """Contagem regressiva antes de desligar/reiniciar, para o usuário poder cancelar."""
+
+    def __init__(self, app, mode, force, secs=30):
+        self.app, self.mode, self.force, self.left = app, mode, force, secs
+        self.job = None
+        win = self.win = tk.Toplevel(app.root)
+        win.title("PyDM")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.var = tk.StringVar()
+        f = ttk.Frame(win, padding=16)
+        f.pack()
+        ttk.Label(f, text="Todos os downloads foram concluídos.", font=("Segoe UI", 10, "bold")).pack()
+        ttk.Label(f, textvariable=self.var).pack(pady=10)
+        ttk.Button(f, text="Cancelar", width=14, command=self.cancel).pack()
+        center_front(win)
+        self.step()
+
+    def step(self):
+        if self.left <= 0:
+            self.win.destroy()
+            power_action(self.mode, self.force)
+            return
+        self.var.set(f"Ação: {self.mode.lower()} o computador em {self.left} segundo(s).")
+        self.left -= 1
+        self.job = self.win.after(1000, self.step)
+
+    def cancel(self):
+        if self.job:
+            try:
+                self.win.after_cancel(self.job)
+            except tk.TclError:
+                pass
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 class ProgressDialog:
     """Janela de progresso do download (estilo IDM): estado, tamanho, velocidade, tempo restante,
     barra de progresso e, em "detalhes", a posição e o progresso de cada conexão.
@@ -741,7 +848,11 @@ class ProgressDialog:
         f = ttk.Frame(win, padding=10)
         f.pack(fill="both", expand=True)
 
-        box = tk.Frame(f, bg="white", bd=1, relief="solid", padx=10, pady=8)
+        self.nb = ttk.Notebook(f)
+        self.nb.pack(fill="x")
+        tab1 = ttk.Frame(self.nb, padding=6)
+        self.nb.add(tab1, text="Progresso do download")
+        box = tk.Frame(tab1, bg="white", bd=1, relief="solid", padx=10, pady=8)
         box.pack(fill="x")
         box.columnconfigure(0, minsize=200)
         box.columnconfigure(1, weight=1)
@@ -756,6 +867,9 @@ class ProgressDialog:
                                         ("Capacidade de continuar", "cap")), start=2):
             tk.Label(box, text=txt, bg="white", anchor="w").grid(row=i, column=0, sticky="w")
             tk.Label(box, textvariable=self.v[key], bg="white", anchor="w").grid(row=i, column=1, sticky="w")
+
+        self.build_speed_tab()
+        self.build_done_tab()
 
         self.bar = ttk.Progressbar(f, maximum=100)
         self.bar.pack(fill="x", pady=10)
@@ -787,6 +901,107 @@ class ProgressDialog:
 
         self.refresh()
         center_front(win, offset=26 * (len(app.progress) % 6))
+
+    # ---------- aba "Limitar velocidade" ----------
+    def build_speed_tab(self):
+        d = self.d
+        t = ttk.Frame(self.nb, padding=12)
+        self.nb.add(t, text="Limitar velocidade")
+        row = ttk.Frame(t)
+        row.pack(fill="x")
+        ttk.Label(row, text="Velocidade", width=12).pack(side="left")
+        ttk.Label(row, textvariable=self.v["vel"]).pack(side="left")
+
+        self.lim_on = tk.BooleanVar(value=d.limit_kbps > 0)
+        self.lim_val = tk.StringVar(value=str(d.limit_kbps or 1024))
+        self.lim_rem = tk.BooleanVar(value=d.limit_remember)
+        ttk.Checkbutton(t, text="Limitar a velocidade", variable=self.lim_on,
+                        command=self.apply_limit).pack(anchor="w", pady=(10, 4))
+        ttk.Label(t, text="Velocidade máxima do download:").pack(anchor="w", padx=(18, 0))
+        r2 = ttk.Frame(t)
+        r2.pack(anchor="w", padx=(18, 0), pady=(2, 10))
+        self.lim_spin = ttk.Spinbox(r2, from_=1, to=1000000, increment=10, width=10,
+                                    textvariable=self.lim_val, command=self.apply_limit)
+        self.lim_spin.pack(side="left")
+        self.lim_spin.bind("<FocusOut>", lambda e: self.apply_limit())
+        self.lim_spin.bind("<Return>", lambda e: self.apply_limit())
+        ttk.Label(r2, text="KBytes/seg").pack(side="left", padx=6)
+        ttk.Checkbutton(t, text="Lembrar configurações de velocidade para este arquivo",
+                        variable=self.lim_rem, command=self.apply_limit).pack(anchor="w", pady=(0, 6))
+        ttk.Button(t, text="Ocultar aba", command=lambda: self.nb.select(0)).pack(anchor="e")
+        self.apply_limit(first=True)
+
+    def apply_limit(self, first=False):
+        try:
+            kb = int(float(self.lim_val.get().replace(",", ".")))
+        except ValueError:
+            kb = 1024
+        kb = max(1, min(1000000, kb))
+        self.lim_val.set(str(kb))
+        on = self.lim_on.get()
+        self.lim_spin.configure(state="normal" if on else "disabled")
+        if not first:
+            self.d.set_limit(kb if on else 0, self.lim_rem.get())
+
+    # ---------- aba "Opções ao concluir" ----------
+    def build_done_tab(self):
+        d, od = self.d, self.d.on_done
+        t = ttk.Frame(self.nb, padding=12)
+        self.nb.add(t, text="Opções ao concluir")
+        top = ttk.Frame(t)
+        top.pack(fill="x")
+        ttk.Label(top, text="Salvar em:").pack(side="left")
+        ttk.Label(top, text=d.path or d.folder).pack(side="left", padx=12)
+
+        self.v_msg = tk.BooleanVar(value=d.show_msg if d.show_msg is not None else self.app.notify_var.get())
+        self.v_modem = tk.BooleanVar(value=od["modem"])
+        self.v_quit = tk.BooleanVar(value=od["quit"])
+        self.v_shut = tk.BooleanVar(value=od["shutdown"])
+        self.v_force = tk.BooleanVar(value=od["force"])
+        self.v_mode = tk.StringVar(value=od["mode"] if od["mode"] in DONE_MODES else DONE_MODES[0])
+        self.v_info = tk.StringVar()
+
+        ttk.Checkbutton(t, text="Ver mensagem de download completo", variable=self.v_msg,
+                        command=self.save_done).pack(anchor="w", pady=(8, 6))
+        ttk.Separator(t).pack(fill="x", pady=2)
+        ttk.Label(t, textvariable=self.v_info).pack(anchor="w", pady=(4, 6))
+        self.cb_modem = ttk.Checkbutton(t, text="Desconectar o modem quando terminar",
+                                        variable=self.v_modem, command=self.save_done)
+        self.cb_modem.pack(anchor="w", pady=1)
+        self.cb_quit = ttk.Checkbutton(t, text="Sair do PyDM quando terminar",
+                                       variable=self.v_quit, command=self.save_done)
+        self.cb_quit.pack(anchor="w", pady=1)
+        sh = ttk.Frame(t)
+        sh.pack(fill="x", pady=1)
+        self.cb_shut = ttk.Checkbutton(sh, text="Desligar o computador quando terminar",
+                                       variable=self.v_shut, command=self.save_done)
+        self.cb_shut.pack(side="left")
+        self.combo = ttk.Combobox(sh, textvariable=self.v_mode, values=DONE_MODES, state="readonly", width=12)
+        self.combo.pack(side="left", padx=16)
+        self.combo.bind("<<ComboboxSelected>>", lambda e: self.save_done())
+        self.cb_force = ttk.Checkbutton(t, text="Forçar o término dos processos",
+                                        variable=self.v_force, command=self.save_done)
+        self.cb_force.pack(anchor="w", padx=(22, 0), pady=1)
+        ttk.Button(t, text="Ocultar aba", command=lambda: self.nb.select(0)).pack(anchor="e", pady=(6, 0))
+        self.refresh_done_state()
+
+    def refresh_done_state(self):
+        show = self.v_msg.get()
+        self.v_info.set('Configurações indisponíveis quando "Ver mensagem de download completo" está ativado'
+                        if show else "Ao concluir, o PyDM executará as ações marcadas abaixo (sem mostrar mensagem)")
+        for cb in (self.cb_modem, self.cb_quit, self.cb_shut):
+            cb.configure(state="disabled" if show else "normal")
+        sh_on = (not show) and self.v_shut.get()
+        self.cb_force.configure(state="normal" if sh_on else "disabled")
+        self.combo.configure(state="readonly" if sh_on else "disabled")
+
+    def save_done(self):
+        d = self.d
+        d.show_msg = bool(self.v_msg.get())
+        d.on_done.update(modem=bool(self.v_modem.get()), quit=bool(self.v_quit.get()),
+                         shutdown=bool(self.v_shut.get()), mode=self.v_mode.get(),
+                         force=bool(self.v_force.get()))
+        self.refresh_done_state()
 
     # ---------- botões ----------
     def toggle_details(self):
@@ -972,6 +1187,7 @@ class App:
         self.settings = load_cfg()
         self.items = []
         self.progress = {}   # id(download) -> ProgressDialog aberto
+        self.pending_done = []  # ações "ao concluir" aguardando o fim de todos os downloads
         self.load()
 
         bar = ttk.Frame(root, padding=6)
@@ -1169,8 +1385,27 @@ class App:
         dlg = self.progress.get(id(d))
         if dlg:
             dlg.close()
-        if self.notify_var.get():
+        show = d.show_msg if d.show_msg is not None else self.notify_var.get()
+        if show:
             CompleteDialog(self, d)
+        elif d.on_done["modem"] or d.on_done["quit"] or d.on_done["shutdown"]:
+            self.pending_done.append(dict(d.on_done))
+
+    def run_done_actions(self, acts):
+        """Executa as ações "ao concluir". Retorna True se o PyDM foi encerrado."""
+        if any(a["modem"] for a in acts) and sys.platform.startswith("win"):
+            try:
+                subprocess.Popen(["rasdial", "/disconnect"], creationflags=NOWIN)
+            except Exception:
+                pass
+        sd = next((a for a in acts if a["shutdown"]), None)
+        if sd:
+            ShutdownCountdown(self, sd["mode"], sd["force"])
+            return False
+        if any(a["quit"] for a in acts):
+            self.on_close()
+            return True
+        return False
 
     def save_notify(self):
         self.settings["show_complete"] = bool(self.notify_var.get())
@@ -1225,12 +1460,18 @@ class App:
             if d.status == "Na fila" and len(active) < MAX_ACTIVE:
                 d.start()
                 active.append(d)
-                self.open_progress(d)   # janela de progresso ao iniciar
+                try:
+                    self.open_progress(d)   # janela de progresso ao iniciar
+                except Exception:
+                    pass   # uma falha na janela nunca deve derrubar o laço principal
         total_speed = 0
         for d in self.items:
             if d.status == "Concluído" and d.announce:
                 d.announce = False
-                self.finished(d)        # janela "Download completo"
+                try:
+                    self.finished(d)    # janela "Download completo" / ações ao concluir
+                except Exception:
+                    pass
             iid = str(id(d))
             dl = d.downloaded
             if d.status == "Baixando":
@@ -1254,6 +1495,10 @@ class App:
         self.status_bar.config(text=f"{len(active)} ativo(s) | Velocidade total: {fmt_size(total_speed)}/s | "
                                     f"{len(self.items)} item(ns) | Extensão: " +
                                     ("ativa" if self.bridge else "porta em uso"))
+        if self.pending_done and not any(x.status in ("Baixando", "Na fila") for x in self.items):
+            acts, self.pending_done = self.pending_done, []
+            if self.run_done_actions(acts):
+                return   # o PyDM foi encerrado
         if int(now) % 3 == 0:
             self.save()
         self.root.after(500, self.tick)
