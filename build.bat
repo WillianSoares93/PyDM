@@ -1,8 +1,8 @@
 @echo off
 echo === Instalando PyInstaller ===
-py -m pip install --upgrade pyinstaller || goto erro
+py -m pip install --upgrade pyinstaller pystray pillow || goto erro
 echo === Gerando PyDM.exe ===
-py -m PyInstaller --noconsole --onefile --name PyDM pydm.py || goto erro
+py -m PyInstaller --noconsole --onefile --hidden-import pystray._win32 --name PyDM pydm.py || goto erro
 set ISCC="%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not exist %ISCC% goto semInno
 echo === Gerando instalador ===
