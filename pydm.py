@@ -72,6 +72,16 @@ def fmt_time(s):
     return f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
 
 
+def log(msg):
+    """Registro simples em ~/.pydm/pydm.log (ajuda a descobrir por que algo não funcionou)."""
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(os.path.join(APP_DIR, "pydm.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n")
+    except OSError:
+        pass
+
+
 def pt(txt):
     """Formato brasileiro: vírgula como separador decimal."""
     return txt.replace(".", ",")
@@ -1533,7 +1543,8 @@ class App:
                 self.tree.insert("", "end", iid=iid, values=row)
         self.status_bar.config(text=f"{len(active)} ativo(s) | Velocidade total: {fmt_size(total_speed)}/s | "
                                     f"{len(self.items)} item(ns) | Extensão: " +
-                                    ("ativa" if self.bridge else "porta em uso"))
+                                    ("ativa" if self.bridge else "porta em uso") +
+                                    f" | Bandeja: {'ativa' if self.tray else 'indisponível'}")
         self.update_tray_title(len(active), total_speed)
         if self.pending_done and not any(x.status in ("Baixando", "Na fila") for x in self.items):
             acts, self.pending_done = self.pending_done, []
@@ -1558,9 +1569,11 @@ class App:
 
     # ---------- bandeja do sistema ----------
     def start_tray(self):
-        """Cria o ícone da bandeja. Se pystray/Pillow não existirem (ou o sistema não suportar),
-        self.tray fica None e fechar a janela encerra o programa, como antes."""
+        """Cria o ícone da bandeja. Se não der (falta pystray/Pillow, sistema sem suporte...),
+        self.tray fica None, o motivo vai para self.tray_error e para o pydm.log."""
+        self.tray, self.tray_error, self.tray_missing = None, "", False
         if sys.platform == "darwin":   # no macOS o pystray briga com o laço de eventos do Tk
+            self.tray_error = "a bandeja não é suportada no macOS"
             return
         try:
             import pystray
@@ -1569,8 +1582,14 @@ class App:
                 pystray.MenuItem("Sair", lambda icon, item: TRAY_EVENTS.put("quit")))
             self.tray = pystray.Icon("PyDM", make_tray_image(), "PyDM", menu)
             self.tray.run_detached()
-        except Exception:
+        except Exception as ex:
+            import traceback
             self.tray = None
+            self.tray_missing = isinstance(ex, ImportError)
+            name = getattr(ex, "name", None)
+            self.tray_error = (f"falta a biblioteca '{name}'" if self.tray_missing and name
+                               else f"{type(ex).__name__}: {ex}")
+            log("Bandeja indisponível: " + self.tray_error + "\n" + traceback.format_exc())
 
     def poll_tray(self):
         """O menu da bandeja roda em outra thread; o Tk só pode ser tocado por esta (a principal)."""
@@ -1580,7 +1599,9 @@ class App:
             except queue.Empty:
                 break
             try:
-                if ev == "show":
+                if isinstance(ev, tuple) and ev[0] == "pip":
+                    self.finish_install(ev[1], ev[2])
+                elif ev == "show":
                     self.show_window()
                 elif ev == "quit":
                     self.request_quit()
@@ -1622,11 +1643,85 @@ class App:
                 pass
 
     def on_close(self):
-        """Botão X da janela: esconde na bandeja (ou encerra, se não houver bandeja)."""
+        """Botão X da janela: esconde na bandeja. Sem bandeja, explica o motivo e deixa o usuário escolher."""
         if self.tray:
             self.hide_to_tray()
         else:
+            self.close_without_tray()
+
+    def close_without_tray(self):
+        frozen = getattr(sys, "frozen", False)   # True quando roda como .exe (PyInstaller)
+        head = ("Não foi possível manter o PyDM na bandeja do sistema.\n\n"
+                f"Motivo: {self.tray_error or 'desconhecido'}\n"
+                f"(detalhes em {os.path.join(APP_DIR, 'pydm.log')})\n\n")
+        if self.tray_missing and not frozen:
+            r = messagebox.askyesnocancel(
+                "Bandeja indisponível", head +
+                "Deseja instalar agora as bibliotecas necessárias (pystray e pillow)?\n\n"
+                "Sim = instalar e usar a bandeja\nNão = fechar o PyDM\nCancelar = voltar ao programa",
+                parent=self.root)
+            if r is True:
+                self.install_tray_libs()
+            elif r is False:
+                self.quit_app()
+            return
+        extra = ("Este executável foi gerado sem o pystray/pillow. Gere-o de novo com o build.bat\n"
+                 "atualizado (ou o build.yml do GitHub Actions), que já inclui as duas bibliotecas.\n\n"
+                 if frozen and self.tray_missing else "")
+        r = messagebox.askyesnocancel(
+            "Bandeja indisponível", head + extra +
+            "Sim = minimizar para a barra de tarefas (os downloads continuam)\n"
+            "Não = fechar o PyDM\nCancelar = voltar ao programa", parent=self.root)
+        if r is True:
+            self.root.iconify()
+        elif r is False:
             self.quit_app()
+
+    def install_tray_libs(self):
+        """Roda 'pip install pystray pillow' em segundo plano (só quando executado pelo Python)."""
+        win = self._install_win = tk.Toplevel(self.root)
+        win.title("Instalando")
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        ttk.Label(win, text="Instalando pystray e pillow...\nIsso leva alguns segundos.",
+                  padding=16).pack()
+        pb = ttk.Progressbar(win, mode="indeterminate", length=260)
+        pb.pack(padx=16, pady=(0, 16))
+        pb.start(12)
+        center_front(win)
+
+        def work():
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "pystray", "pillow"],
+                                   capture_output=True, text=True, timeout=300,
+                                   stdin=subprocess.DEVNULL, creationflags=NOWIN)
+                ok, out = r.returncode == 0, (r.stdout or "") + (r.stderr or "")
+            except Exception as ex:
+                ok, out = False, str(ex)
+            TRAY_EVENTS.put(("pip", ok, out))   # a interface é atualizada pela thread principal
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_install(self, ok, out):
+        try:
+            self._install_win.destroy()
+        except Exception:
+            pass
+        log("pip install pystray pillow -> " + ("ok" if ok else "FALHOU") + "\n" + out[-1500:])
+        if ok:
+            import importlib
+            importlib.invalidate_caches()
+            self.start_tray()
+            if self.tray:
+                self.hide_to_tray()
+                return
+            messagebox.showwarning("Bandeja indisponível",
+                                   "As bibliotecas foram instaladas, mas a bandeja não iniciou:\n"
+                                   f"{self.tray_error}\n\nFeche e abra o PyDM de novo e tente outra vez.",
+                                   parent=self.root)
+        else:
+            messagebox.showerror("Falha na instalação",
+                                 "Não consegui instalar automaticamente. Instale pelo terminal:\n\n"
+                                 "    py -m pip install pystray pillow\n\n" + out[-400:], parent=self.root)
 
     def request_quit(self):
         """"Sair" do menu da bandeja: pede confirmação se houver downloads em andamento."""
