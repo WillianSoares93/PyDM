@@ -1665,7 +1665,7 @@ class App:
             elif r is False:
                 self.quit_app()
             return
-        extra = ("Este executável foi gerado sem o pystray/pillow. Gere-o de novo com o build.bat\n"
+        extra = ("Este executável foi gerado sem o pystray/pillow. Gere-o de novo com o build.bat "
                  "atualizado (ou o build.yml do GitHub Actions), que já inclui as duas bibliotecas.\n\n"
                  if frozen and self.tray_missing else "")
         r = messagebox.askyesnocancel(
