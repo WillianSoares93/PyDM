@@ -13,6 +13,10 @@ PyDM - Gerenciador de downloads estilo IDM
 - Aba "Opções ao concluir" (mensagem, desconectar modem, sair do PyDM, desligar/reiniciar/hibernar/suspender)
 - Segmentação dinâmica: quando uma conexão termina, ela "rouba" metade do trecho
   restante da mais lenta, mantendo todas as conexões ocupadas até o fim
+- Janela principal no estilo do IDM: menus (Tarefas, Arquivo, Downloads, Visualizar), barra de ferramentas
+  com ícones, painel de categorias (Todos / Incompletos / Completos / Tarefas) e lista ordenável com colunas
+- Fila principal, agendador (início/fim em horários e dias), limite de velocidade total, janela de Opções,
+  download em lote, exportar/importar lista, propriedades, mover/renomear, baixar novamente
 - Ao fechar a janela o PyDM continua na bandeja do sistema (botão direito no ícone > Sair para encerrar)
 - Instância única: abrir o PyDM de novo só traz a janela existente de volta
 Requer Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
@@ -20,7 +24,8 @@ Opcional: "pip install pystray pillow" habilita o ícone da bandeja. Sem eles, f
 encerra o programa, como antes.
 """
 
-import os, re, json, time, threading, subprocess, sys, queue, copy
+import os, re, json, time, threading, subprocess, sys, queue, copy, math, shutil
+from datetime import datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.request, urllib.parse
 import tkinter as tk
@@ -169,7 +174,10 @@ def unique_path(folder, name):
 # ---------- configurações (categorias, pastas recentes) ----------
 
 def load_cfg():
-    s = {"categories": copy.deepcopy(DEFAULT_CATEGORIES), "recent": [], "conns": 8, "show_complete": True}
+    s = {"categories": copy.deepcopy(DEFAULT_CATEGORIES), "recent": [], "conns": 8, "show_complete": True,
+         "max_active": MAX_ACTIVE, "speed_limit_kbps": 0, "close_to_tray": True, "monitor_clipboard": False,
+         "show_cats": True, "columns": list(DEFAULT_COLS), "sort": {"col": None, "desc": False},
+         "schedule": copy.deepcopy(DEFAULT_SCHEDULE)}
     try:
         with open(CFG, encoding="utf-8") as f:
             j = json.load(f)
@@ -187,6 +195,26 @@ def load_cfg():
         if isinstance(c, int) and 1 <= c <= 32:
             s["conns"] = c
         s["show_complete"] = bool(j.get("show_complete", True))
+        m = j.get("max_active")
+        if isinstance(m, int) and 1 <= m <= 10:
+            s["max_active"] = m
+        k = j.get("speed_limit_kbps")
+        if isinstance(k, int) and 0 <= k <= 10_000_000:
+            s["speed_limit_kbps"] = k
+        for key in ("close_to_tray", "monitor_clipboard", "show_cats"):
+            if key in j:
+                s[key] = bool(j[key])
+        if isinstance(j.get("columns"), list):
+            s["columns"] = [c for c in COL_IDS if c in j["columns"]]
+        so = j.get("sort")
+        if isinstance(so, dict) and so.get("col") in COL_IDS + ("#0", None):
+            s["sort"] = {"col": so.get("col"), "desc": bool(so.get("desc"))}
+        sc = j.get("schedule")
+        if isinstance(sc, dict):
+            for key, default in DEFAULT_SCHEDULE.items():
+                if key in sc and type(sc[key]) == type(default):
+                    s["schedule"][key] = sc[key]
+            s["schedule"]["days"] = [d for d in s["schedule"]["days"] if isinstance(d, int) and 0 <= d <= 6]
     except Exception:
         pass
     return s
@@ -219,6 +247,123 @@ def category_for(name, cats):
     return "Geral" if "Geral" in cats else next(iter(cats))
 
 
+# ---------- janela principal: colunas, ícones e constantes ----------
+GLOBAL = {"kbps": 0, "next": 0.0}   # limite de velocidade TOTAL (todos os downloads somados)
+GLOBAL_LOCK = threading.Lock()
+
+# id, título, largura, alinhamento, visível por padrão (a coluna "Nome do arquivo" é sempre visível)
+COLS = (
+    ("f", "F.", 30, "center", True),
+    ("tamanho", "Tamanho", 85, "w", True),
+    ("progresso", "Progresso", 90, "w", True),
+    ("eta", "Tempo restante", 110, "w", True),
+    ("vel", "Taxa de transferência", 150, "w", True),
+    ("data", "Data da última tentativa", 185, "w", True),
+    ("desc", "Descrição", 160, "w", True),
+    ("status", "Status", 110, "w", False),
+    ("pasta", "Salvar em", 230, "w", False),
+    ("url", "Endereço de download", 280, "w", False),
+)
+COL_IDS = tuple(c[0] for c in COLS)
+DEFAULT_COLS = [c[0] for c in COLS if c[4]]
+DAYS = ("Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom")
+DEFAULT_SCHEDULE = {"enabled": False, "start_on": True, "start": "02:00", "stop_on": False, "stop": "06:00",
+                    "days": [0, 1, 2, 3, 4, 5, 6], "quit": False, "shutdown": False,
+                    "mode": "Desligar", "force": False}
+KIND_BY_CAT = {"Compactados": "archive", "Documentos": "doc", "Música": "music",
+               "Programas": "program", "Vídeo": "video"}
+
+
+def kind_for(name):
+    """Tipo do ícone de um arquivo (compactado, documento, música...), pela extensão."""
+    return KIND_BY_CAT.get(category_for(name, DEFAULT_CATEGORIES), "doc")
+
+
+class PixelIcons:
+    """Ícones 16x16 desenhados pixel a pixel: não precisam de arquivos de imagem nem do Pillow."""
+
+    def __init__(self, root):
+        self.root, self.cache = root, {}
+
+    def get(self, kind):
+        if kind not in self.cache:
+            self.cache[kind] = self._build(kind)
+        return self.cache[kind]
+
+    def _build(self, kind):
+        g = [[None] * 16 for _ in range(16)]
+
+        def R(x0, y0, x1, y1, c):
+            for y in range(y0, y1 + 1):
+                for x in range(x0, x1 + 1):
+                    g[y][x] = c
+
+        def box(x0, y0, x1, y1, fill, edge):
+            R(x0, y0, x1, y1, edge)
+            R(x0 + 1, y0 + 1, x1 - 1, y1 - 1, fill)
+
+        def page(fill, edge):
+            box(2, 1, 12, 14, fill, edge)
+            R(9, 2, 11, 4, "#d6d6d6")   # dobra do canto
+
+        def folder():
+            R(1, 3, 6, 4, "#d9a521")
+            R(1, 5, 14, 13, "#f4c63d")
+            R(1, 5, 14, 5, "#d9a521")
+            R(1, 13, 14, 13, "#b8901c")
+            R(1, 5, 1, 13, "#b8901c")
+            R(14, 5, 14, 13, "#b8901c")
+
+        w = "#ffffff"
+        if kind == "archive":
+            page("#f7e6a0", "#a8841c")
+            for y in range(2, 10):
+                g[y][7] = "#6b5412" if y % 2 == 0 else "#c7a63a"
+            R(6, 10, 8, 12, "#6b5412")
+        elif kind == "music":
+            page(w, "#7a7a7a")
+            R(8, 5, 8, 10, "#2f6fd6")
+            R(8, 5, 10, 6, "#2f6fd6")
+            R(5, 9, 7, 11, "#2f6fd6")
+        elif kind == "video":
+            R(1, 3, 14, 12, "#2b2b2b")
+            for y in (4, 6, 8, 10):
+                g[y][2] = g[y][13] = w
+            R(4, 4, 11, 11, "#5a8fd0")
+            R(6, 6, 9, 9, "#cfe3f8")
+        elif kind == "program":
+            R(1, 2, 14, 13, "#2f6fd6")
+            R(2, 5, 13, 12, w)
+            R(4, 7, 8, 9, "#9db8e8")
+            g[3][12] = g[3][10] = g[3][8] = w
+        elif kind == "folder":
+            folder()
+        elif kind == "folder_dl":
+            folder()
+            R(8, 8, 14, 14, "#2e9e44")
+            R(11, 9, 11, 12, w)
+            g[11][10] = g[11][12] = w
+        elif kind == "folder_ok":
+            folder()
+            R(8, 8, 14, 14, "#2f6fd6")
+            for x, y in ((9, 11), (10, 12), (11, 11), (12, 10), (13, 9)):
+                g[y][x] = w
+        elif kind == "queue":
+            box(5, 2, 13, 8, "#cfe0f7", "#3a6fb8")
+            box(3, 5, 11, 11, "#cfe0f7", "#3a6fb8")
+            box(1, 8, 9, 14, "#cfe0f7", "#3a6fb8")
+        else:   # "doc"
+            page(w, "#7a7a7a")
+            for y in (6, 8, 10, 12):
+                R(4, y, 10, y, "#b5b5b5")
+        img = tk.PhotoImage(master=self.root, width=16, height=16)
+        for y in range(16):
+            for x in range(16):
+                if g[y][x]:
+                    img.put(g[y][x], to=(x, y))
+        return img
+
+
 class Download:
     def __init__(self, url, folder, conns=8, headers=None):
         self.url, self.folder, self.conns = url, folder, conns
@@ -240,6 +385,9 @@ class Download:
         self.tlock = threading.Lock()
         self._next = 0.0               # instante (monotonic) em que o limitador libera os próximos bytes
         self.show_msg = None           # None = segue a opção global "Avisar ao concluir"
+        self.queued = False            # pertence à fila principal?
+        self.added = time.time()       # quando foi adicionado à lista
+        self.last_try = 0.0            # data da última tentativa de download
         # ações ao concluir (valem só nesta sessão, de propósito: ninguém quer o PC desligando dias depois)
         self.on_done = {"modem": False, "quit": False, "shutdown": False, "mode": "Desligar", "force": False}
         self.speed, self._last = 0.0, (time.time(), 0)
@@ -248,7 +396,8 @@ class Download:
     def to_dict(self):
         j = {k: getattr(self, k) for k in
              ("url", "folder", "conns", "name", "path", "size", "resumable", "segs", "status",
-              "headers", "probed", "description", "category", "show_msg", "limit_remember")}
+              "headers", "probed", "description", "category", "show_msg", "limit_remember",
+              "queued", "added", "last_try")}
         # o limite só é guardado se o usuário marcou "Lembrar configurações de velocidade"
         j["limit_kbps"] = self.limit_kbps if self.limit_remember else 0
         return j
@@ -264,6 +413,12 @@ class Download:
         o.category = d.get("category") or ""
         o.show_msg = d.get("show_msg") if isinstance(d.get("show_msg"), bool) else None
         o.limit_remember = bool(d.get("limit_remember"))
+        o.queued = bool(d.get("queued"))
+        for k in ("added", "last_try"):
+            try:
+                setattr(o, k, float(d.get(k) or 0))
+            except (TypeError, ValueError):
+                setattr(o, k, 0.0)
         try:
             o.limit_kbps = max(0, int(d.get("limit_kbps") or 0)) if o.limit_remember else 0
         except (TypeError, ValueError):
@@ -319,6 +474,20 @@ class Download:
             except OSError:
                 pass
 
+    def reset(self):
+        """Baixar novamente: para o download, descarta o parcial e recomeça do zero."""
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=3)
+        if self.path and os.path.exists(self.part):
+            try:
+                os.remove(self.part)
+            except OSError:
+                pass
+        self.segs, self.error, self.failed = [], "", False
+        self.probed, self.speed = False, 0.0   # consulta o servidor de novo (o arquivo pode ter mudado)
+        self.status = "Na fila"
+
     def _build_segments(self):
         if self.resumable and self.size and self.size > 1_000_000 and self.conns > 1:
             n, step = self.conns, self.size // self.conns
@@ -331,6 +500,7 @@ class Download:
         try:
             self.stop.clear()
             self.failed, self.error, self.status = False, "", "Baixando"
+            self.last_try = time.time()
             os.makedirs(self.folder, exist_ok=True)
             if not self.probed:
                 size, resumable, name = probe(self.url, self.headers)
@@ -361,6 +531,7 @@ class Download:
                 self.status = "Pausado"
             else:
                 os.replace(self.part, self.path)
+                self.last_try = time.time()
                 self.status = "Concluído"
         except Exception as ex:
             self.error, self.status = str(ex), "Erro"
@@ -373,18 +544,22 @@ class Download:
             self._next = 0.0
 
     def _read_size(self):
-        lim = self.limit_kbps * 1024
-        return CHUNK if lim <= 0 else max(2048, min(CHUNK, lim // 8))  # blocos pequenos = limite mais suave
+        lims = [k for k in (self.limit_kbps, GLOBAL["kbps"]) if k > 0]
+        return CHUNK if not lims else max(2048, min(CHUNK, min(lims) * 1024 // 8))  # blocos pequenos = limite mais suave
 
     def _throttle(self, n):
-        """Freio compartilhado: cada bloco lido "reserva" n/limite segundos na linha do tempo comum."""
+        """Freios compartilhados (o do download e o total): cada bloco "reserva" n/limite segundos."""
+        now, delay = time.monotonic(), 0.0
         lim = self.limit_kbps * 1024
-        if lim <= 0:
-            return
-        with self.tlock:
-            now = time.monotonic()
-            self._next = max(self._next, now) + n / lim
-            delay = self._next - now
+        if lim > 0:
+            with self.tlock:
+                self._next = max(self._next, now) + n / lim
+                delay = self._next - now
+        g = GLOBAL["kbps"] * 1024
+        if g > 0:
+            with GLOBAL_LOCK:
+                GLOBAL["next"] = max(GLOBAL["next"], now) + n / g
+                delay = max(delay, GLOBAL["next"] - now)
         while delay > 0 and not self.stop.is_set():
             s = min(delay, 0.2)
             time.sleep(s)
@@ -1220,57 +1395,1041 @@ class CompleteDialog:
             pass
 
 
+# ---------- barra de ferramentas (ícones vetoriais desenhados no Canvas) ----------
+def _fc(on, color, off="#bdbdbd"):
+    return color if on else off
+
+
+def ico_add(c, cx, cy, on):
+    a, b = 4.5, 15
+    pts = [(-a, -b), (a, -b), (a, -a), (b, -a), (b, a), (a, a), (a, b), (-a, b), (-a, a), (-b, a), (-b, -a), (-a, -a)]
+    c.create_polygon([v for x, y in pts for v in (cx + x, cy + y)],
+                     fill=_fc(on, "#3cb371", "#dcdcdc"), outline=_fc(on, "#2a8f58"))
+
+
+def ico_start(c, cx, cy, on):
+    k = _fc(on, "#3a78b5")
+    c.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, outline=k, width=2)
+    c.create_rectangle(cx - 2, cy - 8, cx + 2, cy + 1, fill=k, outline=k)
+    c.create_polygon(cx - 7, cy, cx + 7, cy, cx, cy + 8, fill=k, outline=k)
+
+
+def ico_stop(c, cx, cy, on):
+    k = _fc(on, "#c0504d")
+    c.create_oval(cx - 14, cy - 14, cx + 14, cy + 14, outline=k, width=2)
+    c.create_rectangle(cx - 5, cy - 5, cx + 5, cy + 5, fill=k, outline=k)
+
+
+def ico_hand(c, cx, cy, on):
+    fill, edge = _fc(on, "#f3c969", "#e8e8e8"), _fc(on, "#a8791a")
+    c.create_rectangle(cx - 9, cy - 1, cx + 9, cy + 13, fill=fill, outline=edge)
+    for x, top in ((-9, -9), (-4, -13), (1, -14), (6, -11)):
+        c.create_rectangle(cx + x, cy + top, cx + x + 4, cy, fill=fill, outline=edge)
+    c.create_polygon(cx - 9, cy + 8, cx - 15, cy + 1, cx - 12, cy - 1, cx - 9, cy + 3, fill=fill, outline=edge)
+
+
+def ico_trash(c, cx, cy, on, check=False):
+    k, fill = _fc(on, "#a0306f"), _fc(on, "#f6e6f1", "#f2f2f2")
+    c.create_polygon(cx - 9, cy - 5, cx + 9, cy - 5, cx + 7, cy + 14, cx - 7, cy + 14,
+                     fill=fill, outline=k, width=2)
+    c.create_rectangle(cx - 11, cy - 9, cx + 11, cy - 6, fill=k, outline=k)
+    c.create_rectangle(cx - 3, cy - 12, cx + 3, cy - 9, outline=k, width=2)
+    if check:
+        c.create_line(cx - 4, cy + 3, cx - 1, cy + 7, cx + 5, cy - 1, fill=_fc(on, "#2e9e44"), width=3)
+    else:
+        for dx in (-3, 0, 3):
+            c.create_line(cx + dx, cy - 1, cx + dx, cy + 10, fill=k)
+
+
+def ico_trash_ok(c, cx, cy, on):
+    ico_trash(c, cx, cy, on, check=True)
+
+
+def ico_gear(c, cx, cy, on):
+    k, fill = _fc(on, "#4a62a8"), _fc(on, "#dfe6f7", "#efefef")
+    pts, n = [], 8
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        for r, da in ((10.5, -0.26), (14.5, -0.16), (14.5, 0.16), (10.5, 0.26)):
+            pts += [cx + r * math.cos(a + da), cy + r * math.sin(a + da)]
+    c.create_polygon(pts, fill=fill, outline=k, width=2)
+    c.create_oval(cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5, fill=c.cget("bg"), outline=k, width=2)
+
+
+def ico_clock(c, cx, cy, on):
+    k = _fc(on, "#8a4f9e")
+    c.create_oval(cx - 15, cy - 14, cx - 6, cy - 5, fill=k, outline=k)
+    c.create_oval(cx + 6, cy - 14, cx + 15, cy - 5, fill=k, outline=k)
+    c.create_oval(cx - 13, cy - 10, cx + 13, cy + 16, outline=k, width=2, fill=_fc(on, "#fbf3fd", "#f4f4f4"))
+    c.create_line(cx, cy + 3, cx, cy - 5, fill=k, width=2)
+    c.create_line(cx, cy + 3, cx + 6, cy + 6, fill=k, width=2)
+
+
+def ico_queue(c, cx, cy, on, kind):
+    k, fill = _fc(on, "#3a6fb8"), _fc(on, "#d9e7fa", "#f0f0f0")
+    for d in (0, 4, 8):
+        c.create_rectangle(cx - 14 + d, cy - 14 + d, cx + 2 + d, cy - 2 + d, fill=fill, outline=k)
+    bx, by = cx + 9, cy + 9
+    c.create_oval(bx - 7, by - 7, bx + 7, by + 7, fill=_fc(on, "#2e9e44" if kind == "start" else "#c0504d"),
+                  outline="white", width=1)
+    if kind == "start":
+        c.create_polygon(bx - 4, by - 1, bx + 4, by - 1, bx, by + 4, fill="white", outline="white")
+        c.create_rectangle(bx - 1, by - 5, bx + 1, by - 1, fill="white", outline="white")
+    else:
+        c.create_rectangle(bx - 3, by - 3, bx + 3, by + 3, fill="white", outline="white")
+
+
+class Tooltip:
+    """Dica que aparece ao parar o mouse sobre um widget."""
+
+    def __init__(self, widget, text):
+        self.w, self.text, self.tip, self.job = widget, text, None, None
+        widget.bind("<Enter>", self._sched, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _sched(self, _e=None):
+        self._hide()
+        self.job = self.w.after(700, self._show)
+
+    def _show(self):
+        self.job = None
+        try:
+            x, y = self.w.winfo_rootx() + 10, self.w.winfo_rooty() + self.w.winfo_height() + 4
+            self.tip = tk.Toplevel(self.w)
+            self.tip.wm_overrideredirect(True)
+            self.tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(self.tip, text=self.text, bg="#ffffe1", fg="black", relief="solid", bd=1,
+                     padx=4, pady=1, font=("Segoe UI", 9)).pack()
+        except tk.TclError:
+            self.tip = None
+
+    def _hide(self, _e=None):
+        if self.job:
+            try:
+                self.w.after_cancel(self.job)
+            except tk.TclError:
+                pass
+            self.job = None
+        if self.tip:
+            try:
+                self.tip.destroy()
+            except tk.TclError:
+                pass
+            self.tip = None
+
+
+class ToolButton(tk.Canvas):
+    """Botão grande da barra de ferramentas: ícone + texto embaixo, com destaque ao passar o mouse.
+    Se receber 'menu', mostra uma setinha à direita que abre uma lista de opções."""
+    H = 62
+
+    def __init__(self, master, text, draw, command, menu=None, tip=""):
+        self._text, self._draw, self._command, self._menu = text, draw, command, menu
+        self._iw = 64
+        self._bw = self._iw + (16 if menu else 0)
+        super().__init__(master, width=self._bw, height=self.H, highlightthickness=0, bd=0,
+                         bg=master.winfo_toplevel().cget("bg"))
+        self._enabled, self._hover, self._pressed = True, False, False
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        if tip:
+            Tooltip(self, tip)
+        self.redraw()
+
+    def _set(self, **kw):
+        if "hover" in kw:
+            self._hover = kw["hover"]
+        if "pressed" in kw:
+            self._pressed = kw["pressed"]
+        self.redraw()
+
+    def _release(self, e):
+        was = self._pressed
+        self._set(pressed=False)
+        if not (was and self._enabled and 0 <= e.x < self._bw and 0 <= e.y < self.H):
+            return
+        if self._menu and e.x > self._iw:
+            m = self._menu()
+            m.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.H)
+            m.grab_release()
+        else:
+            self._command()
+
+    def set_enabled(self, on):
+        if on != self._enabled:
+            self._enabled = on
+            self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        on = self._enabled
+        if on and (self._hover or self._pressed):
+            self.create_rectangle(0, 0, self._bw - 1, self.H - 1, outline="#99c8f0",
+                                  fill="#cce4f7" if self._pressed else "#e5f1fb")
+        self._draw(self, self._iw // 2, 23, on)
+        self.create_text(self._iw // 2, 50, text=self._text, fill="#000000" if on else "#8a8a8a",
+                         font=("Segoe UI", 9))
+        if self._menu:
+            x, y = self._bw - 9, 27
+            self.create_polygon(x - 4, y - 2, x + 4, y - 2, x, y + 3, fill="#333333" if on else "#b0b0b0",
+                                outline="")
+
+
+# ---------- janelas auxiliares ----------
+def make_modal(win, parent):
+    win.transient(parent)
+    try:
+        win.wait_visibility()
+        win.grab_set()
+    except tk.TclError:
+        pass
+
+
+def ask_delete(app, msg, title="Excluir"):
+    """Confirmação com a opção de apagar também os arquivos do disco. Retorna (confirmou, apagar_arquivos)."""
+    win = tk.Toplevel(app.root)
+    win.title(title)
+    win.resizable(False, False)
+    res, var = {"ok": False}, tk.BooleanVar(value=False)
+    f = ttk.Frame(win, padding=14)
+    f.pack()
+    ttk.Label(f, text=msg, justify="left").pack(anchor="w")
+    ttk.Checkbutton(f, text="Excluir também os arquivos do disco", variable=var).pack(anchor="w", pady=(10, 0))
+    bf = ttk.Frame(f)
+    bf.pack(pady=(14, 0))
+
+    def done(ok):
+        res["ok"] = ok
+        win.destroy()
+
+    ttk.Button(bf, text="Sim", width=12, command=lambda: done(True)).pack(side="left", padx=6)
+    ttk.Button(bf, text="Não", width=12, command=lambda: done(False)).pack(side="left", padx=6)
+    win.protocol("WM_DELETE_WINDOW", lambda: done(False))
+    win.bind("<Escape>", lambda e: done(False))
+    center_front(win)
+    make_modal(win, app.root)
+    app.root.wait_window(win)
+    return res["ok"], var.get()
+
+
+class BatchDialog:
+    """Adicionar vários downloads de uma vez (um endereço por linha)."""
+
+    def __init__(self, app, urls=None):
+        self.app = app
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Adicionar download em lote")
+        win.transient(app.root)
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Endereços dos arquivos (um por linha):").pack(anchor="w")
+        tf = ttk.Frame(f)
+        tf.pack(fill="both", expand=True, pady=(4, 8))
+        self.txt = tk.Text(tf, width=84, height=12, wrap="none", undo=True)
+        sb = ttk.Scrollbar(tf, command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        if urls is None:
+            try:
+                urls = [l.strip() for l in app.root.clipboard_get().splitlines()
+                        if l.strip().lower().startswith(("http://", "https://"))]
+            except tk.TclError:
+                urls = []
+        self.txt.insert("1.0", "\n".join(urls))
+
+        self.where = tk.StringVar(value="auto")
+        self.folder = tk.StringVar(value=DEFAULT_FOLDER)
+        self.start = tk.BooleanVar(value=False)
+        ttk.Radiobutton(f, text="Salvar na pasta de cada categoria (automático)", variable=self.where,
+                        value="auto").pack(anchor="w")
+        r = ttk.Frame(f)
+        r.pack(fill="x", pady=2)
+        ttk.Radiobutton(r, text="Salvar em:", variable=self.where, value="custom").pack(side="left")
+        ttk.Entry(r, textvariable=self.folder).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(r, text="...", width=3, command=self.browse).pack(side="left")
+        ttk.Checkbutton(f, text="Iniciar os downloads agora (senão, ficam na fila principal)",
+                        variable=self.start).pack(anchor="w", pady=(8, 0))
+        bf = ttk.Frame(f)
+        bf.pack(pady=(12, 0))
+        ttk.Button(bf, text="OK", width=12, command=self.ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancelar", width=12, command=win.destroy).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
+        center_front(win)
+
+    def browse(self):
+        p = filedialog.askdirectory(parent=self.win, initialdir=self.folder.get() or DEFAULT_FOLDER)
+        if p:
+            self.folder.set(os.path.normpath(p))
+            self.where.set("custom")
+
+    def ok(self):
+        lines = [l.strip() for l in self.txt.get("1.0", "end").splitlines() if l.strip()]
+        urls = [l for l in lines if l.lower().startswith(("http://", "https://"))]
+        if not urls:
+            messagebox.showerror("Erro", "Informe pelo menos um endereço http/https válido.", parent=self.win)
+            return
+        folder = self.folder.get().strip() if self.where.get() == "custom" else None
+        n = self.app.add_batch(urls, folder, self.start.get())
+        self.win.destroy()
+        if n == 0:
+            messagebox.showinfo("PyDM", "Todos os endereços já estavam na lista.", parent=self.app.root)
+        elif len(urls) < len(lines):
+            messagebox.showinfo("PyDM", f"{len(lines) - len(urls)} linha(s) sem endereço válido foram ignoradas.",
+                                parent=self.app.root)
+
+
+class PropertiesDialog:
+    """Propriedades do download (a descrição pode ser editada)."""
+
+    def __init__(self, app, d):
+        self.app, self.d = app, d
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Propriedades do download")
+        win.transient(app.root)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        f.columnconfigure(1, weight=1)
+
+        def dt(t):
+            return time.strftime("%b %d %H:%M:%S %Y", time.localtime(t)) if t else "-"
+        dl = d.downloaded
+        rows = (("Nome", d.name or guess_name(d.url)), ("Salvar em", d.path or d.folder), ("Endereço", d.url),
+                ("Tamanho", f"{pt(fmt_size(d.size, 2))} ({d.size} bytes)" if d.size else "Desconhecido"),
+                ("Baixado", pt(fmt_size(dl, 2))), ("Status", d.status + (f": {d.error}" if d.error else "")),
+                ("Categoria", d.category or "-"), ("Conexões", str(d.conns)),
+                ("Capacidade de continuar", ("Sim" if d.resumable else "Não") if d.probed else "-"),
+                ("Na fila principal", "Sim" if d.queued else "Não"),
+                ("Adicionado em", dt(d.added)), ("Última tentativa", dt(d.last_try)))
+        self.vars = []   # precisam ficar em self, senão o Tk apaga o texto dos campos
+        for i, (k, v) in enumerate(rows):
+            ttk.Label(f, text=k).grid(row=i, column=0, sticky="w", pady=2, padx=(0, 10))
+            var = tk.StringVar(value=v)
+            self.vars.append(var)
+            ttk.Entry(f, textvariable=var, state="readonly", width=70).grid(row=i, column=1, sticky="ew", pady=2)
+        ttk.Label(f, text="Descrição").grid(row=len(rows), column=0, sticky="w", pady=(8, 2))
+        self.desc = tk.StringVar(value=d.description)
+        ttk.Entry(f, textvariable=self.desc).grid(row=len(rows), column=1, sticky="ew", pady=(8, 2))
+        bf = ttk.Frame(f)
+        bf.grid(row=len(rows) + 1, column=0, columnspan=2, pady=(12, 0))
+        ttk.Button(bf, text="OK", width=12, command=self.ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancelar", width=12, command=win.destroy).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
+        center_front(win)
+
+    def ok(self):
+        self.d.description = self.desc.get().strip()
+        self.app.save()
+        self.win.destroy()
+
+
+class OptionsDialog:
+    """Opções gerais: conexões, downloads simultâneos, limite de velocidade total e categorias."""
+
+    def __init__(self, app):
+        self.app = app
+        s = app.settings
+        self.cats = copy.deepcopy(s["categories"])
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Opções")
+        win.transient(app.root)
+        win.resizable(False, False)
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        # --- Geral ---
+        g = ttk.Frame(nb, padding=14)
+        nb.add(g, text="Geral")
+        self.v_conns = tk.IntVar(value=s["conns"])
+        self.v_max = tk.IntVar(value=s["max_active"])
+        self.v_clip = tk.BooleanVar(value=app.clip_var.get())
+        self.v_notify = tk.BooleanVar(value=app.notify_var.get())
+        self.v_tray = tk.BooleanVar(value=s["close_to_tray"])
+        r = ttk.Frame(g)
+        r.pack(anchor="w", pady=3)
+        ttk.Label(r, text="Conexões por download:", width=28).pack(side="left")
+        ttk.Spinbox(r, from_=1, to=32, width=5, textvariable=self.v_conns).pack(side="left")
+        r = ttk.Frame(g)
+        r.pack(anchor="w", pady=3)
+        ttk.Label(r, text="Downloads simultâneos:", width=28).pack(side="left")
+        ttk.Spinbox(r, from_=1, to=10, width=5, textvariable=self.v_max).pack(side="left")
+        ttk.Checkbutton(g, text="Monitorar a área de transferência (perguntar ao copiar um link)",
+                        variable=self.v_clip).pack(anchor="w", pady=(12, 3))
+        ttk.Checkbutton(g, text="Mostrar a mensagem \"Download completo\" ao concluir",
+                        variable=self.v_notify).pack(anchor="w", pady=3)
+        ttk.Checkbutton(g, text="Ao fechar a janela, continuar na bandeja do sistema" +
+                        ("" if app.tray else "  (indisponível: sem pystray/pillow)"),
+                        variable=self.v_tray, state="normal" if app.tray else "disabled").pack(anchor="w", pady=3)
+
+        # --- Velocidade ---
+        v = ttk.Frame(nb, padding=14)
+        nb.add(v, text="Velocidade")
+        self.v_lim_on = tk.BooleanVar(value=s["speed_limit_kbps"] > 0)
+        self.v_lim = tk.StringVar(value=str(s["speed_limit_kbps"] or 1024))
+        ttk.Checkbutton(v, text="Limitar a velocidade total de todos os downloads",
+                        variable=self.v_lim_on, command=self.lim_state).pack(anchor="w")
+        r = ttk.Frame(v)
+        r.pack(anchor="w", padx=(20, 0), pady=6)
+        self.lim_spin = ttk.Spinbox(r, from_=1, to=1000000, increment=50, width=10, textvariable=self.v_lim)
+        self.lim_spin.pack(side="left")
+        ttk.Label(r, text="KBytes/seg").pack(side="left", padx=6)
+        ttk.Label(v, text="O limite é dividido entre os downloads em andamento.\n"
+                          "Cada download ainda pode ter seu próprio limite (janela de progresso).",
+                  foreground="#555555", justify="left").pack(anchor="w", pady=(10, 0))
+        self.lim_state()
+
+        # --- Salvar em (categorias) ---
+        c = ttk.Frame(nb, padding=14)
+        nb.add(c, text="Salvar em")
+        self.ct = ttk.Treeview(c, columns=("pasta", "exts"), show="tree headings", height=7, selectmode="browse")
+        for cid, t, w in (("#0", "Categoria", 110), ("pasta", "Pasta", 250), ("exts", "Extensões", 220)):
+            self.ct.heading(cid, text=t)
+            self.ct.column(cid, width=w, anchor="w")
+        self.ct.pack(fill="x")
+        self.ct.bind("<<TreeviewSelect>>", self.load_fields)
+        self.cur = None
+        self.v_folder, self.v_exts = tk.StringVar(), tk.StringVar()
+        r = ttk.Frame(c)
+        r.pack(fill="x", pady=(10, 2))
+        ttk.Label(r, text="Pasta:", width=11).pack(side="left")
+        ttk.Entry(r, textvariable=self.v_folder).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(r, text="...", width=3, command=self.browse).pack(side="left")
+        r = ttk.Frame(c)
+        r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Extensões:", width=11).pack(side="left")
+        ttk.Entry(r, textvariable=self.v_exts).pack(side="left", fill="x", expand=True, padx=4)
+        r = ttk.Frame(c)
+        r.pack(pady=(10, 0))
+        ttk.Button(r, text="Atualizar categoria", command=self.commit_fields).pack(side="left", padx=4)
+        ttk.Button(r, text="Nova categoria...", command=self.new_cat).pack(side="left", padx=4)
+        ttk.Button(r, text="Excluir categoria", command=self.del_cat).pack(side="left", padx=4)
+        self.fill_cats()
+
+        bf = ttk.Frame(win)
+        bf.pack(pady=10)
+        ttk.Button(bf, text="OK", width=12, command=self.ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancelar", width=12, command=win.destroy).pack(side="left", padx=6)
+        ttk.Button(bf, text="Aplicar", width=12, command=self.apply).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
+        center_front(win)
+
+    def lim_state(self):
+        self.lim_spin.configure(state="normal" if self.v_lim_on.get() else "disabled")
+
+    # ---------- categorias ----------
+    def fill_cats(self, select=None):
+        self.ct.delete(*self.ct.get_children())
+        for name, info in self.cats.items():
+            self.ct.insert("", "end", iid=name, text=name, values=(info["folder"], " ".join(info["exts"])))
+        first = select if select in self.cats else next(iter(self.cats), None)
+        if first:
+            self.ct.selection_set(first)
+
+    def load_fields(self, _e=None):
+        s = self.ct.selection()
+        self.cur = s[0] if s else None
+        if self.cur in self.cats:
+            self.v_folder.set(self.cats[self.cur]["folder"])
+            self.v_exts.set(" ".join(self.cats[self.cur]["exts"]))
+
+    def commit_fields(self):
+        if self.cur not in self.cats:
+            return
+        folder = self.v_folder.get().strip()
+        if folder:
+            self.cats[self.cur]["folder"] = os.path.normpath(folder)
+        self.cats[self.cur]["exts"] = [e.lower().lstrip(".") for e in re.split(r"[,\s;]+", self.v_exts.get()) if e.strip(". ")]
+        self.fill_cats(self.cur)
+
+    def browse(self):
+        p = filedialog.askdirectory(parent=self.win, initialdir=self.v_folder.get() or DEFAULT_FOLDER)
+        if p:
+            self.v_folder.set(os.path.normpath(p))
+
+    def new_cat(self):
+        name = simpledialog.askstring("Nova categoria", "Nome da categoria:", parent=self.win)
+        name = (name or "").strip()
+        if not name:
+            return
+        if name in self.cats:
+            messagebox.showerror("Erro", "Já existe uma categoria com esse nome.", parent=self.win)
+            return
+        self.cats[name] = {"folder": os.path.join(DEFAULT_FOLDER, name), "exts": []}
+        self.fill_cats(name)
+
+    def del_cat(self):
+        if not self.cur or self.cur == "Geral" or len(self.cats) <= 1:
+            messagebox.showinfo("PyDM", 'A categoria "Geral" não pode ser excluída.', parent=self.win)
+            return
+        del self.cats[self.cur]
+        self.cur = None
+        self.fill_cats()
+
+    # ---------- aplicar ----------
+    def apply(self):
+        app, s = self.app, self.app.settings
+
+        def num(var, lo, hi, default):
+            try:
+                return max(lo, min(hi, int(float(str(var.get()).replace(",", ".")))))
+            except (ValueError, tk.TclError):
+                return default
+        s["conns"] = num(self.v_conns, 1, 32, s["conns"])
+        s["max_active"] = num(self.v_max, 1, 10, s["max_active"])
+        app.conns_var.set(s["conns"])
+        app.clip_var.set(self.v_clip.get())
+        s["monitor_clipboard"] = bool(self.v_clip.get())
+        app.notify_var.set(self.v_notify.get())
+        s["show_complete"] = bool(self.v_notify.get())
+        if app.tray:
+            s["close_to_tray"] = bool(self.v_tray.get())
+        self.commit_fields()
+        s["categories"] = self.cats
+        save_cfg(s)
+        app.set_global_limit(num(self.v_lim, 1, 1000000, 1024) if self.v_lim_on.get() else 0)
+        app.rebuild_categories()
+
+    def ok(self):
+        self.apply()
+        self.win.destroy()
+
+
+class SchedulerDialog:
+    """Agendador: inicia/para a fila principal em horários definidos e pode sair/desligar ao terminar."""
+
+    def __init__(self, app):
+        self.app = app
+        sc = app.settings["schedule"]
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Agendador")
+        win.transient(app.root)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=14)
+        f.pack(fill="both", expand=True)
+        self.v_en = tk.BooleanVar(value=sc["enabled"])
+        ttk.Checkbutton(f, text="Ativar o agendamento da fila principal", variable=self.v_en).pack(anchor="w")
+
+        lf = ttk.LabelFrame(f, text="Horários", padding=10)
+        lf.pack(fill="x", pady=(10, 6))
+        self.v_start_on, self.v_stop_on = tk.BooleanVar(value=sc["start_on"]), tk.BooleanVar(value=sc["stop_on"])
+        self.sh, self.sm = self._hm(sc["start"])
+        self.eh, self.em = self._hm(sc["stop"])
+        for row, (txt, on, h, m) in enumerate((("Iniciar a fila às", self.v_start_on, self.sh, self.sm),
+                                               ("Parar a fila às", self.v_stop_on, self.eh, self.em))):
+            ttk.Checkbutton(lf, text=txt, variable=on, width=18).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Spinbox(lf, from_=0, to=23, width=3, wrap=True, format="%02.0f", textvariable=h).grid(row=row, column=1)
+            ttk.Label(lf, text=":").grid(row=row, column=2)
+            ttk.Spinbox(lf, from_=0, to=59, width=3, wrap=True, format="%02.0f", textvariable=m).grid(row=row, column=3)
+
+        df = ttk.LabelFrame(f, text="Dias da semana", padding=10)
+        df.pack(fill="x", pady=6)
+        self.v_days = [tk.BooleanVar(value=i in sc["days"]) for i in range(7)]
+        for i, name in enumerate(DAYS):
+            ttk.Checkbutton(df, text=name, variable=self.v_days[i]).pack(side="left", padx=4)
+
+        af = ttk.LabelFrame(f, text="Quando a fila terminar", padding=10)
+        af.pack(fill="x", pady=6)
+        self.v_quit, self.v_shut = tk.BooleanVar(value=sc["quit"]), tk.BooleanVar(value=sc["shutdown"])
+        self.v_mode = tk.StringVar(value=sc["mode"] if sc["mode"] in DONE_MODES else DONE_MODES[0])
+        self.v_force = tk.BooleanVar(value=sc["force"])
+        ttk.Checkbutton(af, text="Sair do PyDM", variable=self.v_quit).pack(anchor="w")
+        r = ttk.Frame(af)
+        r.pack(anchor="w", pady=2)
+        ttk.Checkbutton(r, text="Desligar o computador", variable=self.v_shut).pack(side="left")
+        ttk.Combobox(r, textvariable=self.v_mode, values=DONE_MODES, state="readonly", width=12).pack(side="left", padx=10)
+        ttk.Checkbutton(af, text="Forçar o término dos processos", variable=self.v_force).pack(anchor="w", padx=(22, 0))
+        ttk.Label(f, text="O PyDM precisa estar aberto (pode ficar na bandeja) para o agendamento funcionar.",
+                  foreground="#555555").pack(anchor="w", pady=(6, 0))
+
+        bf = ttk.Frame(f)
+        bf.pack(pady=(12, 0))
+        ttk.Button(bf, text="Iniciar fila agora", command=self.run_now).pack(side="left", padx=6)
+        ttk.Button(bf, text="OK", width=10, command=self.ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancelar", width=10, command=win.destroy).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
+        center_front(win)
+
+    @staticmethod
+    def _hm(txt):
+        try:
+            h, m = txt.split(":")
+            return tk.StringVar(value=f"{int(h):02d}"), tk.StringVar(value=f"{int(m):02d}")
+        except ValueError:
+            return tk.StringVar(value="00"), tk.StringVar(value="00")
+
+    @staticmethod
+    def _t(h, m):
+        try:
+            return f"{max(0, min(23, int(float(h.get())))):02d}:{max(0, min(59, int(float(m.get())))):02d}"
+        except (ValueError, tk.TclError):
+            return "00:00"
+
+    def save(self):
+        sc = self.app.settings["schedule"]
+        sc.update(enabled=bool(self.v_en.get()), start_on=bool(self.v_start_on.get()),
+                  start=self._t(self.sh, self.sm), stop_on=bool(self.v_stop_on.get()),
+                  stop=self._t(self.eh, self.em), days=[i for i in range(7) if self.v_days[i].get()],
+                  quit=bool(self.v_quit.get()), shutdown=bool(self.v_shut.get()),
+                  mode=self.v_mode.get(), force=bool(self.v_force.get()))
+        save_cfg(self.app.settings)
+
+    def ok(self):
+        self.save()
+        self.win.destroy()
+
+    def run_now(self):
+        self.save()
+        self.win.destroy()
+        self.app.start_queue(scheduled=True)
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title("PyDM - Gerenciador de Downloads")
-        root.geometry("1100x440")
+        root.geometry("1080x580")
+        root.minsize(780, 380)
         os.makedirs(APP_DIR, exist_ok=True)
         self.settings = load_cfg()
         self.items = []
         self.progress = {}   # id(download) -> ProgressDialog aberto
         self.pending_done = []  # ações "ao concluir" aguardando o fim de todos os downloads
+        self.sched_arm = False  # True = a fila foi iniciada pelo agendador (executar "ao terminar" no fim)
+        self._sched_key = ""
+        self._rows = {}      # cache das linhas da lista (só atualiza o que mudou)
+        self.filter_key = "all"
         self.load()
-
-        bar = ttk.Frame(root, padding=6)
-        bar.pack(fill="x")
-        for txt, cmd in (("➕ Adicionar URL", self.add_dialog), ("▶ Iniciar", self.resume_sel),
-                         ("⏸ Pausar", self.pause_sel), ("🗑 Remover", self.remove_sel),
-                         ("📂 Abrir pasta", self.open_folder)):
-            ttk.Button(bar, text=txt, command=cmd).pack(side="left", padx=2)
+        self.icons = PixelIcons(root)
         self.conns_var = tk.IntVar(value=self.settings["conns"])
-        ttk.Label(bar, text="Conexões:").pack(side="left", padx=(14, 2))
-        sp = ttk.Spinbox(bar, from_=1, to=32, width=4, textvariable=self.conns_var, command=self.save_conns)
-        sp.pack(side="left")
-        sp.bind("<FocusOut>", self.save_conns)
-        sp.bind("<Return>", self.save_conns)
-        self.clip_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Monitorar área de transferência",
-                        variable=self.clip_var).pack(side="right")
+        self.clip_var = tk.BooleanVar(value=self.settings["monitor_clipboard"])
         self.notify_var = tk.BooleanVar(value=self.settings.get("show_complete", True))
-        ttk.Checkbutton(bar, text="Avisar ao concluir", variable=self.notify_var,
-                        command=self.save_notify).pack(side="right", padx=(0, 10))
+        self.show_cats_var = tk.BooleanVar(value=self.settings["show_cats"])
+        self.limit_var = tk.IntVar(value=self.settings["speed_limit_kbps"])
+        GLOBAL["kbps"] = self.settings["speed_limit_kbps"]
+        ttk.Style().configure("Treeview", rowheight=20)
+        self.mi = {}   # itens de menu que mudam de estado (habilitado/desabilitado)
+        self.tb = {}   # botões da barra de ferramentas
 
-        cols = ("nome", "tamanho", "progresso", "velocidade", "eta", "status", "descricao")
-        self.tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="extended")
-        for c, t, w in (("nome", "Arquivo", 290), ("tamanho", "Tamanho", 90), ("progresso", "Progresso", 90),
-                        ("velocidade", "Velocidade", 100), ("eta", "Restante", 80), ("status", "Status", 120),
-                        ("descricao", "Descrição", 160)):
-            self.tree.heading(c, text=t)
-            self.tree.column(c, width=w, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.tree.bind("<Double-1>", lambda e: self.open_file())
+        self.build_menu()
+        self.build_toolbar()
         self.status_bar = ttk.Label(root, text="", anchor="w", padding=4)
-        self.status_bar.pack(fill="x")
+        self.status_bar.pack(side="bottom", fill="x")
+        self.build_body()
         self.last_clip = ""
+        try:   # não perguntar logo na abertura sobre um link que já estava copiado
+            self.last_clip = root.clipboard_get().strip()
+        except tk.TclError:
+            pass
         self.bridge = start_bridge()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        root.bind("<Control-n>", lambda e: self.add_dialog())
         self.tray, self.tray_notified = None, False
         self._tray_text, self._tray_t = "", 0.0
         self.start_tray()
         self.tick()
         self.watch_clipboard()
         self.poll_tray()
+
+    # ---------- menus ----------
+    def build_menu(self):
+        mb = tk.Menu(self.root)
+        self.root.config(menu=mb)
+
+        def sub(label):
+            m = tk.Menu(mb, tearoff=0, postcommand=self.update_menus)
+            mb.add_cascade(label=label, menu=m)
+            return m
+
+        def item(m, key, label, cmd, accel=None):
+            m.add_command(label=label, command=cmd, accelerator=accel)
+            if key:
+                self.mi[key] = (m, m.index("end"))
+
+        t = sub("Tarefas")
+        item(t, None, "Adicionar novo download...", self.add_dialog, "Ctrl+N")
+        item(t, None, "Adicionar download em lote...", self.batch_dialog)
+        item(t, None, "Adicionar da área de transferência", self.add_from_clipboard, "Ctrl+V")
+        t.add_separator()
+        item(t, None, "Exportar lista de downloads...", self.export_list)
+        item(t, None, "Importar lista de downloads...", self.import_list)
+        t.add_separator()
+        item(t, None, "Sair", self.request_quit)
+
+        a = sub("Arquivo")
+        item(a, "open", "Abrir", self.open_file, "Enter")
+        item(a, "openwith", "Abrir com...", self.open_with)
+        item(a, "folder", "Abrir pasta", self.open_folder)
+        a.add_separator()
+        item(a, "move", "Mover/Renomear...", self.move_rename)
+        item(a, "copy", "Copiar endereço", self.copy_url)
+        item(a, "newurl", "Atualizar endereço de download...", self.update_url)
+        a.add_separator()
+        item(a, "props", "Propriedades", self.show_properties, "Alt+Enter")
+
+        d = sub("Downloads")
+        item(d, "start", "Iniciar download", self.resume_sel)
+        item(d, "stop", "Parar download", self.pause_sel)
+        item(d, "stopall", "Parar todos os downloads", self.pause_all)
+        d.add_separator()
+        item(d, "delete", "Excluir", self.delete_sel, "Del")
+        item(d, "delcomp", "Excluir concluídos", self.delete_completed)
+        item(d, "redown", "Baixar novamente", self.redownload_sel)
+        d.add_separator()
+        item(d, "qadd", "Adicionar à fila principal", self.queue_add)
+        item(d, "qrem", "Remover da fila principal", self.queue_remove)
+        item(d, None, "Iniciar fila principal", self.start_queue)
+        item(d, None, "Parar fila principal", self.stop_queue)
+        d.add_separator()
+        item(d, None, "Agendador...", self.scheduler_dialog)
+        lm = tk.Menu(d, tearoff=0)
+        d.add_cascade(label="Limitar velocidade total", menu=lm)
+        for kb, txt in ((0, "Sem limite"), (100, "100 KB/s"), (500, "500 KB/s"), (1024, "1 MB/s"),
+                        (2048, "2 MB/s"), (5120, "5 MB/s")):
+            lm.add_radiobutton(label=txt, variable=self.limit_var, value=kb,
+                               command=lambda kb=kb: self.set_global_limit(kb))
+        lm.add_separator()
+        lm.add_command(label="Personalizado...", command=self.custom_limit)
+        d.add_separator()
+        item(d, None, "Opções...", self.options_dialog)
+
+        v = sub("Visualizar")
+        v.add_checkbutton(label="Categorias", variable=self.show_cats_var,
+                          command=lambda: self.toggle_cats(self.show_cats_var.get()))
+        cm = tk.Menu(v, tearoff=0)
+        v.add_cascade(label="Colunas", menu=cm)
+        self.col_vars = {}
+        for cid, title, *_ in COLS:
+            self.col_vars[cid] = tk.BooleanVar(value=cid in self.settings["columns"])
+            cm.add_checkbutton(label=title, variable=self.col_vars[cid], command=self.on_columns_changed)
+        sm = tk.Menu(v, tearoff=0)
+        v.add_cascade(label="Classificar por", menu=sm)
+        so = self.settings["sort"]
+        self.sort_var = tk.StringVar(value=so["col"] or "none")
+        self.order_var = tk.StringVar(value="desc" if so["desc"] else "asc")
+        for cid, title in (("#0", "Nome do arquivo"),) + tuple((c[0], c[1]) for c in COLS):
+            sm.add_radiobutton(label=title, variable=self.sort_var, value=cid, command=self.on_sort_menu)
+        sm.add_radiobutton(label="Sem ordenação (ordem de adição)", variable=self.sort_var, value="none",
+                           command=self.on_sort_menu)
+        sm.add_separator()
+        sm.add_radiobutton(label="Ordem crescente", variable=self.order_var, value="asc", command=self.on_sort_menu)
+        sm.add_radiobutton(label="Ordem decrescente", variable=self.order_var, value="desc", command=self.on_sort_menu)
+        v.add_separator()
+        v.add_command(label="Selecionar tudo", command=self.select_all, accelerator="Ctrl+A")
+
+    # ---------- barra de ferramentas ----------
+    def build_toolbar(self):
+        bar = ttk.Frame(self.root, padding=(4, 2))
+        bar.pack(fill="x")
+
+        def btn(key, text, draw, cmd, tip, menu=None):
+            b = ToolButton(bar, text, draw, cmd, menu=menu, tip=tip)
+            b.pack(side="left", padx=1)
+            self.tb[key] = b
+
+        btn("add", "Adicionar", ico_add, self.add_dialog, "Adicionar novo download (Ctrl+N)")
+        btn("start", "Iniciar", ico_start, self.resume_sel, "Iniciar ou retomar o download selecionado")
+        btn("stop", "Parar", ico_stop, self.pause_sel, "Parar o download selecionado")
+        btn("stopall", "Parar...", ico_hand, self.pause_all, "Parar todos os downloads")
+        btn("delete", "Excluir", ico_trash, self.delete_sel, "Excluir o download selecionado")
+        btn("delcomp", "Excluir...", ico_trash_ok, self.delete_completed, "Excluir os downloads concluídos")
+        btn("options", "Opções", ico_gear, self.options_dialog, "Opções do PyDM")
+        btn("sched", "Agendar", ico_clock, self.scheduler_dialog, "Agendador da fila principal")
+        btn("startq", "Iniciar fila", lambda c, x, y, on: ico_queue(c, x, y, on, "start"), self.start_queue,
+            "Iniciar a fila principal", menu=lambda: self.queue_menu(True))
+        btn("stopq", "Parar fila", lambda c, x, y, on: ico_queue(c, x, y, on, "stop"), self.stop_queue,
+            "Parar a fila principal", menu=lambda: self.queue_menu(False))
+        ttk.Separator(self.root).pack(fill="x")
+
+    def queue_menu(self, start):
+        m = tk.Menu(self.root, tearoff=0)
+        if start:
+            m.add_command(label="Fila principal", command=self.start_queue)
+            m.add_command(label="Todos os downloads incompletos", command=self.start_all)
+        else:
+            m.add_command(label="Fila principal", command=self.stop_queue)
+            m.add_command(label="Todos os downloads", command=self.pause_all)
+        return m
+
+    # ---------- corpo: categorias + lista ----------
+    def build_body(self):
+        self.pw = ttk.PanedWindow(self.root, orient="horizontal")
+        self.pw.pack(fill="both", expand=True)
+
+        self.left = ttk.Frame(self.pw)
+        head = ttk.Frame(self.left)
+        head.pack(fill="x")
+        ttk.Label(head, text="Categorias", padding=(4, 3)).pack(side="left")
+        x = tk.Label(head, text="\u2715", cursor="hand2", padx=6)
+        x.pack(side="right")
+        x.bind("<Button-1>", lambda e: self.toggle_cats(False))
+        self.cat_tree = ttk.Treeview(self.left, show="tree", selectmode="browse")
+        self.cat_tree.pack(fill="both", expand=True)
+        self.cat_tree.bind("<<TreeviewSelect>>", self.on_cat_select)
+        self.rebuild_categories()
+
+        self.right = ttk.Frame(self.pw)
+        self.tree = ttk.Treeview(self.right, columns=COL_IDS, show="tree headings", selectmode="extended")
+        vs = ttk.Scrollbar(self.right, orient="vertical", command=self.tree.yview)
+        hs = ttk.Scrollbar(self.right, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        self.tree.column("#0", width=260, minwidth=120, anchor="w")
+        for cid, title, w, anc, _vis in COLS:
+            self.tree.column(cid, width=w, minwidth=24, anchor=anc, stretch=False)
+        self.apply_columns()
+        self.apply_headings()
+        hs.pack(side="bottom", fill="x")
+        vs.pack(side="right", fill="y")
+        self.tree.pack(fill="both", expand=True)
+        self.tree.bind("<Double-1>", self.on_double)
+        self.tree.bind("<Return>", lambda e: self.open_file())
+        self.tree.bind("<Delete>", lambda e: self.delete_sel())
+        self.tree.bind("<Control-a>", lambda e: self.select_all())
+        self.tree.bind("<Control-v>", lambda e: self.add_from_clipboard())
+        self.tree.bind("<Alt-Return>", lambda e: self.show_properties())
+        self.tree.bind("<Button-3>", self.context_menu)
+        self.tree.bind("<<TreeviewSelect>>", self.update_toolbar)
+
+        if self.settings["show_cats"]:
+            self.pw.add(self.left, weight=0)
+            self.root.after(120, self._place_sash)
+        self.pw.add(self.right, weight=1)
+
+    def _place_sash(self):
+        try:
+            self.pw.sashpos(0, 200)
+        except tk.TclError:
+            pass
+
+    def toggle_cats(self, show):
+        self.settings["show_cats"] = bool(show)
+        self.show_cats_var.set(bool(show))
+        present = str(self.left) in self.pw.panes()
+        if show and not present:
+            self.pw.insert(0, self.left)
+            self.root.after(60, self._place_sash)
+        elif not show and present:
+            self.pw.forget(self.left)
+        save_cfg(self.settings)
+
+    # ---------- painel de categorias ----------
+    def rebuild_categories(self):
+        t, ic = self.cat_tree, self.icons
+        was = {k: self.root.tk.getboolean(t.item(k, "open")) for k in t.get_children()}
+        sel = t.selection()[0] if t.selection() else self.filter_key
+        t.delete(*t.get_children())
+        cats = self.settings["categories"]
+        for key, label, kind in (("all", "Todos os downloads", "folder"), ("inc", "Incompletos", "folder_dl"),
+                                 ("done", "Completos", "folder_ok")):
+            t.insert("", "end", iid=key, text=label, image=ic.get(kind), open=was.get(key, key == "all"))
+            for name in cats:
+                t.insert(key, "end", iid=f"{key}:{name}", text=name, image=ic.get(KIND_BY_CAT.get(name, "folder")))
+        t.insert("", "end", iid="queue", text="Tarefas", image=ic.get("folder"), open=True)
+        t.insert("queue", "end", iid="queue:main", text="Fila principal", image=ic.get("queue"))
+        if not t.exists(sel):
+            sel = "all"
+        self.filter_key = sel
+        t.selection_set(sel)
+
+    def on_cat_select(self, _e=None):
+        s = self.cat_tree.selection()
+        if s:
+            self.filter_key = s[0]
+            self.refresh_list()
+            self.update_toolbar()
+
+    def matches(self, d, key):
+        group, _, cat = key.partition(":")
+        if group == "inc" and d.status == "Concluído":
+            return False
+        if group == "done" and d.status != "Concluído":
+            return False
+        if group == "queue":
+            return d.queued
+        return not cat or d.category == cat
+
+    # ---------- colunas e ordenação ----------
+    def apply_columns(self):
+        self.tree["displaycolumns"] = [c for c in COL_IDS if c in self.settings["columns"]]
+
+    def apply_headings(self):
+        so = self.settings["sort"]
+        for cid, title in (("#0", "Nome do arquivo"),) + tuple((c[0], c[1]) for c in COLS):
+            mark = (" \u25bc" if so["desc"] else " \u25b2") if so["col"] == cid else ""
+            self.tree.heading(cid, text=title + mark, command=lambda c=cid: self.set_sort(c))
+
+    def on_columns_changed(self):
+        self.settings["columns"] = [c for c in COL_IDS if self.col_vars[c].get()]
+        self.apply_columns()
+        save_cfg(self.settings)
+
+    def set_sort(self, col):
+        so = self.settings["sort"]
+        so["desc"] = (not so["desc"]) if so["col"] == col else False
+        so["col"] = col
+        self.sort_var.set(col)
+        self.order_var.set("desc" if so["desc"] else "asc")
+        self.after_sort()
+
+    def on_sort_menu(self):
+        col = self.sort_var.get()
+        self.settings["sort"] = {"col": None if col == "none" else col, "desc": self.order_var.get() == "desc"}
+        self.after_sort()
+
+    def after_sort(self):
+        self.apply_headings()
+        save_cfg(self.settings)
+        self.refresh_list()
+
+    def sort_key(self, col):
+        def prog(d):
+            if d.status == "Concluído":
+                return 100.0
+            return d.downloaded * 100 / d.size if d.size else 0.0
+        return {
+            "#0": lambda d: (d.name or guess_name(d.url)).lower(),
+            "f": lambda d: (not d.queued),
+            "tamanho": lambda d: d.size or 0,
+            "progresso": prog,
+            "eta": lambda d: (d.size - d.downloaded) / d.speed if d.size and d.speed > 1 else float("inf"),
+            "vel": lambda d: d.speed,
+            "data": lambda d: d.last_try,
+            "desc": lambda d: d.description.lower(),
+            "status": lambda d: d.status,
+            "pasta": lambda d: d.folder.lower(),
+            "url": lambda d: d.url.lower(),
+        }[col]
+
+    # ---------- lista de downloads ----------
+    def row_for(self, d):
+        dl = d.downloaded
+        if d.status == "Concluído":
+            prog = "Completo"
+        elif d.status == "Erro":
+            prog = "Erro"
+        elif d.status == "Na fila" and not dl:
+            prog = "Na fila"
+        elif d.size:
+            prog = pt(f"{dl * 100 / d.size:.2f}%")
+        else:
+            prog = pt(fmt_size(dl, 2)) if dl else ""
+        running = d.status == "Baixando"
+        vals = {
+            "f": "\u2630" if d.queued and d.status != "Concluído" else "",
+            "tamanho": pt(fmt_size(d.size, 2)) if d.size else "",
+            "progresso": prog,
+            "eta": fmt_eta((d.size - dl) / d.speed) if running and d.size and d.speed > 1 else "",
+            "vel": pt(fmt_size(d.speed, 2)) + "/s" if running and d.speed else "",
+            "data": time.strftime("%b %d %H:%M:%S %Y", time.localtime(d.last_try)) if d.last_try else "",
+            "desc": d.description,
+            "status": d.status + (f": {d.error[:40]}" if d.status == "Erro" and d.error else ""),
+            "pasta": d.folder,
+            "url": d.url,
+        }
+        return d.name or guess_name(d.url), tuple(vals[c] for c in COL_IDS)
+
+    def refresh_list(self):
+        vis = [d for d in self.items if self.matches(d, self.filter_key)]
+        so = self.settings["sort"]
+        if so["col"]:
+            vis.sort(key=self.sort_key(so["col"]), reverse=so["desc"])
+        want = [str(id(d)) for d in vis]
+        if list(self.tree.get_children()) != want:
+            keep = set(want)
+            for iid in self.tree.get_children():
+                if iid not in keep:
+                    self.tree.delete(iid)
+                    self._rows.pop(iid, None)
+            for i, d in enumerate(vis):
+                iid = str(id(d))
+                if self.tree.exists(iid):
+                    self.tree.move(iid, "", i)
+                else:
+                    self.tree.insert("", i, iid=iid)
+        for d in vis:
+            iid = str(id(d))
+            name, vals = self.row_for(d)
+            if self._rows.get(iid) != (name, vals):
+                self._rows[iid] = (name, vals)
+                self.tree.item(iid, text=name, values=vals, image=self.icons.get(kind_for(name)))
+
+    # ---------- estado dos botões e menus ----------
+    def selected(self):
+        ids = self.tree.selection()
+        return [d for d in self.items if str(id(d)) in ids]
+
+    def update_toolbar(self, _e=None):
+        sel = self.selected()
+        running = any(d.status in ("Baixando", "Na fila") for d in self.items)
+        en = {
+            "start": any(d.status in ("Pausado", "Erro") for d in sel),
+            "stop": any(d.status in ("Baixando", "Na fila") for d in sel),
+            "stopall": running,
+            "delete": bool(sel),
+            "delcomp": any(d.status == "Concluído" for d in self.items),
+            "startq": any(d.queued and d.status != "Concluído" for d in self.items),
+            "stopq": any(d.queued and d.status in ("Baixando", "Na fila") for d in self.items),
+        }
+        for k, b in self.tb.items():
+            b.set_enabled(en.get(k, True))
+
+    def update_menus(self):
+        sel = self.selected()
+        one = len(sel) == 1
+        states = {
+            "open": one, "openwith": one and sel[0].status == "Concluído", "folder": one, "move": one,
+            "copy": bool(sel), "newurl": one and sel[0].status != "Concluído", "props": one,
+            "start": any(d.status in ("Pausado", "Erro") for d in sel),
+            "stop": any(d.status in ("Baixando", "Na fila") for d in sel),
+            "stopall": any(d.status in ("Baixando", "Na fila") for d in self.items),
+            "delete": bool(sel), "delcomp": any(d.status == "Concluído" for d in self.items),
+            "redown": bool(sel),
+            "qadd": any(not d.queued and d.status != "Concluído" for d in sel),
+            "qrem": any(d.queued for d in sel),
+        }
+        for key, on in states.items():
+            m, i = self.mi[key]
+            m.entryconfigure(i, state="normal" if on else "disabled")
+
+    def context_menu(self, e):
+        iid = self.tree.identify_row(e.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        sel = self.selected()
+        one = len(sel) == 1
+        m = tk.Menu(self.root, tearoff=0)
+
+        def add(label, cmd, on=True):
+            m.add_command(label=label, command=cmd, state="normal" if on else "disabled")
+        add("Abrir", self.open_file, one)
+        add("Abrir pasta", self.open_folder, one)
+        m.add_separator()
+        add("Iniciar download", self.resume_sel, any(d.status in ("Pausado", "Erro") for d in sel))
+        add("Parar download", self.pause_sel, any(d.status in ("Baixando", "Na fila") for d in sel))
+        add("Baixar novamente", self.redownload_sel, bool(sel))
+        m.add_separator()
+        add("Adicionar à fila principal", self.queue_add, any(not d.queued and d.status != "Concluído" for d in sel))
+        add("Remover da fila principal", self.queue_remove, any(d.queued for d in sel))
+        m.add_separator()
+        add("Mover/Renomear...", self.move_rename, one)
+        add("Copiar endereço", self.copy_url, bool(sel))
+        add("Atualizar endereço de download...", self.update_url, one and sel[0].status != "Concluído")
+        m.add_separator()
+        add("Excluir", self.delete_sel, bool(sel))
+        add("Propriedades", self.show_properties, one)
+        m.tk_popup(e.x_root, e.y_root)
+        m.grab_release()
+
+    def on_double(self, e):
+        if self.tree.identify_region(e.x, e.y) in ("cell", "tree"):
+            self.open_file()
+
+    def select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+        return "break"
 
     # ---------- persistência ----------
     def load(self):
@@ -1279,6 +2438,9 @@ class App:
                 self.items = [Download.from_dict(d) for d in json.load(f)]
         except Exception:
             self.items = []
+        for d in self.items:   # itens de versões antigas não tinham categoria
+            if not d.category:
+                d.category = category_for(d.name or guess_name(d.url), self.settings["categories"])
 
     def save(self):
         try:
@@ -1331,7 +2493,7 @@ class App:
         self.add(url, folder, self.settings["conns"], headers,
                  name=os.path.basename(path), path=path, size=size, resumable=resumable,
                  probed=bool(info), description=description, category=category,
-                 status="Na fila" if start else "Pausado")
+                 status="Na fila" if start else "Pausado", queued=not start)
         cats = self.settings["categories"]
         if remember and category in cats:
             cats[category]["folder"] = folder
@@ -1378,10 +2540,7 @@ class App:
         e.focus()
         e.select_range(0, "end")
 
-    def selected(self):
-        ids = self.tree.selection()
-        return [d for d in self.items if str(id(d)) in ids]
-
+    # ---------- iniciar / parar ----------
     def resume_sel(self):
         for d in self.selected():
             if d.status in ("Pausado", "Erro"):
@@ -1389,30 +2548,285 @@ class App:
 
     def pause_sel(self):
         for d in self.selected():
-            if d.status == "Baixando":
-                d.pause()
-            elif d.status == "Na fila":
-                d.status = "Pausado"
+            self._stop(d)
 
-    def remove_sel(self):
+    def pause_all(self):
+        for d in self.items:
+            self._stop(d)
+
+    @staticmethod
+    def _stop(d):
+        if d.status == "Baixando":
+            d.pause()
+        elif d.status == "Na fila":
+            d.status = "Pausado"
+
+    def start_all(self):
+        for d in self.items:
+            if d.status in ("Pausado", "Erro"):
+                d.status = "Na fila"
+
+    # ---------- excluir ----------
+    def delete_sel(self):
         sel = self.selected()
         if not sel:
             return
-        if not messagebox.askyesno("Remover", f"Remover {len(sel)} item(ns) da lista?\n"
-                                              "(Arquivos incompletos serão apagados; os concluídos são mantidos.)"):
-            return
-        self.remove_items(sel)
+        ok, files = ask_delete(self, f"Excluir {len(sel)} download(s) da lista?\n"
+                                     "(Arquivos incompletos são sempre apagados.)")
+        if ok:
+            self.remove_items(sel, files)
 
-    def remove_items(self, sel):
-        for d in sel:
+    def delete_completed(self):
+        done = [d for d in self.items if d.status == "Concluído"]
+        if not done:
+            return
+        ok, files = ask_delete(self, f"Excluir {len(done)} download(s) concluído(s) da lista?",
+                               "Excluir concluídos")
+        if ok:
+            self.remove_items(done, files)
+
+    def remove_items(self, sel, delete_files=False):
+        for d in list(sel):
             dlg = self.progress.get(id(d))
             if dlg:
                 dlg.close()
             d.cancel()
+            if delete_files and d.status == "Concluído" and d.path and os.path.exists(d.path):
+                try:
+                    os.remove(d.path)
+                except OSError:
+                    pass
             if d in self.items:
                 self.items.remove(d)
-            if self.tree.exists(str(id(d))):
-                self.tree.delete(str(id(d)))
+            iid = str(id(d))
+            if self.tree.exists(iid):
+                self.tree.delete(iid)
+            self._rows.pop(iid, None)
+        self.save()
+        self.update_toolbar()
+
+    def redownload_sel(self):
+        sel = self.selected()
+        if not sel:
+            return
+        if not messagebox.askyesno("Baixar novamente",
+                                   f"Baixar de novo {len(sel)} arquivo(s) desde o início?\n"
+                                   "O que já foi baixado será descartado e o arquivo existente "
+                                   "será substituído ao concluir.", parent=self.root):
+            return
+        for d in sel:
+            d.reset()
+
+    # ---------- fila principal ----------
+    def queue_add(self):
+        for d in self.selected():
+            if d.status != "Concluído":
+                d.queued = True
+
+    def queue_remove(self):
+        for d in self.selected():
+            d.queued = False
+
+    def start_queue(self, scheduled=False):
+        n = 0
+        for d in self.items:
+            if d.queued and d.status in ("Pausado", "Erro"):
+                d.status = "Na fila"
+                n += 1
+        if scheduled and (n or any(d.queued and d.status in ("Baixando", "Na fila") for d in self.items)):
+            self.sched_arm = True   # ao terminar a fila, executa o que foi marcado no agendador
+        elif scheduled:
+            log("Agendador: fila principal vazia, nada para iniciar.")
+
+    def stop_queue(self):
+        self.sched_arm = False
+        for d in self.items:
+            if d.queued:
+                self._stop(d)
+
+    def check_schedule(self):
+        """Chamado a cada tick: dispara início/parada da fila no minuto marcado (uma vez por minuto)."""
+        sc = self.settings["schedule"]
+        if not sc["enabled"]:
+            return
+        now = datetime.now()
+        key = now.strftime("%Y-%m-%d %H:%M")
+        if key == self._sched_key:
+            return
+        self._sched_key = key
+        if now.weekday() not in sc["days"]:
+            return
+        hm = now.strftime("%H:%M")
+        if sc["start_on"] and hm == sc["start"]:
+            self.start_queue(scheduled=True)
+        if sc["stop_on"] and hm == sc["stop"]:
+            self.stop_queue()
+
+    def sched_finish(self):
+        """Fila iniciada pelo agendador terminou: aplica "Quando a fila terminar"."""
+        sc = self.settings["schedule"]
+        if sc["quit"] or sc["shutdown"]:
+            self.pending_done.append({"modem": False, "quit": sc["quit"], "shutdown": sc["shutdown"],
+                                      "mode": sc["mode"], "force": sc["force"]})
+
+    # ---------- limite de velocidade total ----------
+    def set_global_limit(self, kb):
+        kb = max(0, int(kb))
+        self.settings["speed_limit_kbps"] = kb
+        GLOBAL["kbps"] = kb
+        with GLOBAL_LOCK:
+            GLOBAL["next"] = 0.0
+        self.limit_var.set(kb)
+        save_cfg(self.settings)
+
+    def custom_limit(self):
+        kb = simpledialog.askinteger("Limitar velocidade total", "Velocidade máxima total (KBytes/seg):",
+                                     parent=self.root, minvalue=1, maxvalue=1000000,
+                                     initialvalue=self.settings["speed_limit_kbps"] or 1024)
+        if kb:
+            self.set_global_limit(kb)
+
+    # ---------- adicionar ----------
+    def add_batch(self, urls, folder, start):
+        """Adiciona vários endereços de uma vez. Retorna quantos entraram (ignora os já existentes)."""
+        cats, n = self.settings["categories"], 0
+        seen = {d.url for d in self.items if d.status != "Concluído"}
+        for u in urls:
+            if u in seen:
+                continue
+            seen.add(u)
+            cat = category_for(guess_name(u), cats)
+            self.add(u, folder or cats[cat]["folder"], self.settings["conns"], {}, category=cat,
+                     status="Na fila" if start else "Pausado", queued=not start)
+            n += 1
+        return n
+
+    def batch_dialog(self, urls=None):
+        BatchDialog(self, urls)
+
+    def add_from_clipboard(self):
+        try:
+            c = self.root.clipboard_get()
+        except tk.TclError:
+            c = ""
+        urls = [l.strip() for l in c.splitlines() if l.strip().lower().startswith(("http://", "https://"))]
+        if not urls:
+            messagebox.showinfo("PyDM", "Não há nenhum endereço (http/https) na área de transferência.",
+                                parent=self.root)
+        elif len(urls) == 1:
+            self.open_info(urls[0])
+        else:
+            self.batch_dialog(urls)
+        return "break"
+
+    def export_list(self):
+        if not self.items:
+            messagebox.showinfo("PyDM", "A lista de downloads está vazia.", parent=self.root)
+            return
+        p = filedialog.asksaveasfilename(parent=self.root, title="Exportar lista de downloads",
+                                         defaultextension=".json", initialfile="pydm-downloads.json",
+                                         filetypes=[("Lista do PyDM (.json)", "*.json"), ("Só os endereços (.txt)", "*.txt")])
+        if not p:
+            return
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                if p.lower().endswith(".txt"):
+                    f.write("\n".join(d.url for d in self.items) + "\n")
+                else:   # os cookies/headers de sessão não são exportados, de propósito
+                    json.dump([{"url": d.url, "name": d.name, "folder": d.folder, "category": d.category,
+                                "description": d.description, "size": d.size, "status": d.status}
+                               for d in self.items], f, ensure_ascii=False, indent=2)
+        except OSError as ex:
+            messagebox.showerror("Erro", f"Não foi possível salvar o arquivo:\n{ex}", parent=self.root)
+
+    def import_list(self):
+        p = filedialog.askopenfilename(parent=self.root, title="Importar lista de downloads",
+                                       filetypes=[("Listas (.json, .txt)", "*.json *.txt"), ("Todos os arquivos", "*.*")])
+        if not p:
+            return
+        urls = []
+        try:
+            with open(p, encoding="utf-8") as f:
+                raw = f.read()
+            try:
+                data = json.loads(raw)
+                urls = [(x.get("url") if isinstance(x, dict) else x) for x in data] if isinstance(data, list) else []
+            except ValueError:
+                urls = raw.splitlines()
+        except OSError as ex:
+            messagebox.showerror("Erro", f"Não foi possível ler o arquivo:\n{ex}", parent=self.root)
+            return
+        urls = [u.strip() for u in urls if isinstance(u, str) and u.strip().lower().startswith(("http://", "https://"))]
+        if not urls:
+            messagebox.showinfo("PyDM", "Nenhum endereço (http/https) encontrado no arquivo.", parent=self.root)
+        else:
+            self.batch_dialog(urls)
+
+    # ---------- janelas ----------
+    def options_dialog(self):
+        OptionsDialog(self)
+
+    def scheduler_dialog(self):
+        SchedulerDialog(self)
+
+    def show_properties(self):
+        sel = self.selected()
+        if sel:
+            PropertiesDialog(self, sel[0])
+
+    # ---------- arquivo: mover, copiar endereço, atualizar endereço ----------
+    def move_rename(self):
+        sel = self.selected()
+        if not sel:
+            return
+        d = sel[0]
+        if d.status == "Baixando":
+            messagebox.showinfo("PyDM", "Pare o download antes de mover ou renomear o arquivo.", parent=self.root)
+            return
+        cur = d.path or os.path.join(d.folder, d.name or guess_name(d.url))
+        new = filedialog.asksaveasfilename(parent=self.root, title="Mover/Renomear", initialdir=os.path.dirname(cur),
+                                           initialfile=os.path.basename(cur))
+        if not new or os.path.normpath(new) == os.path.normpath(cur):
+            return
+        new = os.path.normpath(new)
+        try:
+            os.makedirs(os.path.dirname(new), exist_ok=True)
+            if d.path:
+                src = d.path if d.status == "Concluído" else d.part
+                if os.path.exists(src):
+                    shutil.move(src, new if d.status == "Concluído" else new + ".part")
+        except OSError as ex:
+            messagebox.showerror("Erro", f"Não foi possível mover o arquivo:\n{ex}", parent=self.root)
+            return
+        d.path, d.folder, d.name = new, os.path.dirname(new), os.path.basename(new)
+        self.save()
+
+    def copy_url(self):
+        urls = "\n".join(d.url for d in self.selected())
+        if urls:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(urls)
+
+    def update_url(self):
+        sel = self.selected()
+        if not sel:
+            return
+        d = sel[0]
+        if d.status == "Baixando":
+            messagebox.showinfo("PyDM", "Pare o download antes de atualizar o endereço.", parent=self.root)
+            return
+        u = simpledialog.askstring("Atualizar endereço de download",
+                                   "Novo endereço (URL) do arquivo.\nO download continua de onde parou.",
+                                   initialvalue=d.url, parent=self.root)
+        u = (u or "").strip()
+        if not u:
+            return
+        if not u.lower().startswith(("http://", "https://")):
+            messagebox.showerror("Erro", "Informe uma URL válida (http/https).", parent=self.root)
+            return
+        d.url = u
+        if d.status == "Erro":
+            d.status, d.error = "Pausado", ""
         self.save()
 
     def open_progress(self, d):
@@ -1467,17 +2881,39 @@ class App:
         self.settings["conns"] = n   # vale para os próximos downloads
         save_cfg(self.settings)
 
-    def open_folder(self):
-        sel = self.selected()
-        self._open(sel[0].folder if sel else DEFAULT_FOLDER)
-
     def open_file(self):
-        """Duplo clique: abre o arquivo concluído; nos demais, abre a janela de progresso."""
+        """Enter/duplo clique: abre o arquivo concluído; nos demais, abre a janela de progresso."""
         for d in self.selected():
             if d.status == "Concluído":
                 self._open(d.path)
             else:
                 self.open_progress(d)
+
+    def open_with(self):
+        sel = self.selected()
+        if not sel or not sel[0].path:
+            return
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", sel[0].path])
+            else:
+                self._open(sel[0].path)
+        except Exception:
+            pass
+
+    def open_folder(self):
+        sel = self.selected()
+        if not sel:
+            self._open(DEFAULT_FOLDER)
+            return
+        d = sel[0]
+        if d.status == "Concluído" and d.path and os.path.exists(d.path) and sys.platform.startswith("win"):
+            try:   # abre a pasta já com o arquivo selecionado
+                subprocess.Popen(["explorer", f"/select,{os.path.normpath(d.path)}"])
+                return
+            except Exception:
+                pass
+        self._open(d.folder)
 
     @staticmethod
     def _open(path):
@@ -1506,7 +2942,7 @@ class App:
                 self.add(j["url"], DEFAULT_FOLDER, self.settings["conns"], j["headers"])
         active = [d for d in self.items if d.status == "Baixando"]
         for d in self.items:
-            if d.status == "Na fila" and len(active) < MAX_ACTIVE:
+            if d.status == "Na fila" and len(active) < self.settings["max_active"]:
                 d.start()
                 active.append(d)
                 try:
@@ -1515,13 +2951,14 @@ class App:
                     pass   # uma falha na janela nunca deve derrubar o laço principal
         total_speed = 0
         for d in self.items:
-            if d.status == "Concluído" and d.announce:
-                d.announce = False
-                try:
-                    self.finished(d)    # janela "Download completo" / ações ao concluir
-                except Exception:
-                    pass
-            iid = str(id(d))
+            if d.status == "Concluído":
+                d.queued = False   # download concluído sai da fila
+                if d.announce:
+                    d.announce = False
+                    try:
+                        self.finished(d)    # janela "Download completo" / ações ao concluir
+                    except Exception:
+                        pass
             dl = d.downloaded
             if d.status == "Baixando":
                 t0, b0 = d._last
@@ -1532,21 +2969,25 @@ class App:
                 total_speed += d.speed
             else:
                 d.speed, d._last = 0, (now, dl)
-            pct = f"{dl * 100 / d.size:.1f}%" if d.size else ("100%" if d.status == "Concluído" else "--")
-            eta = fmt_time((d.size - dl) / d.speed) if d.size and d.speed > 1 else "--"
-            status = d.status + (f": {d.error[:40]}" if d.status == "Erro" and d.error else "")
-            row = (d.name or d.url, fmt_size(d.size), pct,
-                   f"{fmt_size(d.speed)}/s" if d.speed else "", eta, status, d.description)
-            if self.tree.exists(iid):
-                self.tree.item(iid, values=row)
-            else:
-                self.tree.insert("", "end", iid=iid, values=row)
-        self.status_bar.config(text=f"{len(active)} ativo(s) | Velocidade total: {fmt_size(total_speed)}/s | "
+        try:
+            self.refresh_list()
+            self.update_toolbar()
+        except tk.TclError:
+            pass
+        try:
+            self.check_schedule()
+        except Exception as ex:
+            log(f"Agendador: {ex!r}")
+        busy = any(x.status in ("Baixando", "Na fila") for x in self.items)
+        if self.sched_arm and not busy:
+            self.sched_arm = False
+            self.sched_finish()
+        self.status_bar.config(text=f"{len(active)} ativo(s) | Velocidade total: {pt(fmt_size(total_speed))}/s | "
                                     f"{len(self.items)} item(ns) | Extensão: " +
                                     ("ativa" if self.bridge else "porta em uso") +
                                     f" | Bandeja: {'ativa' if self.tray else 'indisponível'}")
         self.update_tray_title(len(active), total_speed)
-        if self.pending_done and not any(x.status in ("Baixando", "Na fila") for x in self.items):
+        if self.pending_done and not busy:
             acts, self.pending_done = self.pending_done, []
             if self.run_done_actions(acts):
                 return   # o PyDM foi encerrado
@@ -1644,8 +3085,10 @@ class App:
 
     def on_close(self):
         """Botão X da janela: esconde na bandeja. Sem bandeja, explica o motivo e deixa o usuário escolher."""
-        if self.tray:
+        if self.tray and self.settings.get("close_to_tray", True):
             self.hide_to_tray()
+        elif self.tray:
+            self.request_quit()
         else:
             self.close_without_tray()
 
