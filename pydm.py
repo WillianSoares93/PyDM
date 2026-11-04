@@ -24,8 +24,9 @@ Opcional: "pip install pystray pillow" habilita o ícone da bandeja. Sem eles, f
 encerra o programa, como antes.
 """
 
-import os, re, json, time, threading, subprocess, sys, queue, copy, math, shutil
+import os, re, json, time, threading, subprocess, sys, queue, copy, math, shutil, fnmatch, hashlib, glob, shlex
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.request, urllib.parse
 import tkinter as tk
@@ -55,8 +56,37 @@ DEFAULT_CATEGORIES = {
                   "exts": ["exe", "msi", "apk", "dmg", "deb", "rpm", "bat", "msu"]},
     "Vídeo": {"folder": os.path.join(DEFAULT_FOLDER, "Video"),
               "exts": ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp"]},
-    "Geral": {"folder": DEFAULT_FOLDER, "exts": []},
+    "Geral": {"folder": DEFAULT_FOLDER, "exts": [], "remember": True},
 }
+
+
+# ---- padrões das novas opções (inspirados no IDM) ----
+DEFAULT_CAPTURE_EXTS = ("3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 EXE GZ GZIP IMG ISO LZH M4A M4V MKV MOV "
+                        "MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PLJ PPS PPT QT R0* R1* RA RAR RM RMVB "
+                        "SEA SIT SITX TAR TIF TIFF WAV WMA WMV Z ZIP").split()
+DEFAULT_EXCLUDE_SITES = ["*.update.microsoft.com", "download.windowsupdate.com", "*.download.windowsupdate.com",
+                         "siteseal.thawte.com", "ecom.cimetz.com", "*.voice2page.com"]
+# Ordem = ordem de detecção pelo User-Agent (Edge e Opera também têm "Chrome/" no UA, então vêm antes dele)
+DEFAULT_BROWSERS = [
+    {"name": "Microsoft Edge", "ua": "Edg/", "on": True, "builtin": True},
+    {"name": "Opera", "ua": "OPR/", "on": True, "builtin": True},
+    {"name": "Mozilla Firefox", "ua": "Firefox/", "on": True, "builtin": True},
+    {"name": "Google Chrome", "ua": "Chrome/", "on": True, "builtin": True},
+    {"name": "Apple Safari", "ua": "Safari/", "on": True, "builtin": True},
+]
+DYNAMIC_EXTS = {"PHP", "PHP3", "PHTML", "ASP", "ASPX", "JSP", "JSPX", "CGI", "PL", "DO", "ACTION"}
+KEY_CHOICES = ("Nenhuma", "Alt", "Ctrl", "Shift", "Ctrl+Alt", "Ctrl+Shift", "Alt+Shift")
+DEFAULT_KEYS = {"prevent": "Alt", "force": "Ctrl+Alt"}
+DEFAULT_MENU = {"link": True, "video": True, "audio": True, "image": True, "page": False}
+MENU_LABELS = (("link", "Links"), ("video", "Vídeos"), ("audio", "Áudios"), ("image", "Imagens"),
+               ("page", "Página (clique em área vazia)"))
+DEFAULT_MENU_TITLE = "Baixar com PyDM"
+DEFAULT_PROGRESS_UI = {"speed_tab": True, "done_tab": True, "details": True}
+DEFAULT_AV = {"enabled": False, "program": "", "args": '-Scan -ScanType 3 -File "{file}"'}
+DUP_ACTIONS = (("ask", "Mostrar uma caixa de diálogo e perguntar o que fazer"),
+               ("rename", "Adicionar mesmo assim (com outro nome se o arquivo já existir)"),
+               ("ignore", "Ignorar o link duplicado"))
+SETTINGS_REF = {"s": None}   # a Bridge (outra thread) lê as configurações por aqui
 
 
 def fmt_size(n, dec=1):
@@ -130,7 +160,7 @@ def center_front(win, offset=0):
 
 
 def req(url, headers=None):
-    h = {"User-Agent": UA}
+    h = {"User-Agent": GLOBAL.get("ua") or UA}
     h.update(headers or {})
     return urllib.request.Request(url, headers=h)
 
@@ -177,7 +207,14 @@ def load_cfg():
     s = {"categories": copy.deepcopy(DEFAULT_CATEGORIES), "recent": [], "conns": 8, "show_complete": True,
          "max_active": MAX_ACTIVE, "speed_limit_kbps": 0, "close_to_tray": True, "monitor_clipboard": False,
          "show_cats": True, "columns": list(DEFAULT_COLS), "sort": {"col": None, "desc": False},
-         "schedule": copy.deepcopy(DEFAULT_SCHEDULE)}
+         "schedule": copy.deepcopy(DEFAULT_SCHEDULE),
+         "clip_auto": False, "browsers": copy.deepcopy(DEFAULT_BROWSERS), "keys": dict(DEFAULT_KEYS),
+         "menu": dict(DEFAULT_MENU), "menu_title": DEFAULT_MENU_TITLE,
+         "capture_exts": list(DEFAULT_CAPTURE_EXTS), "exclude_sites": list(DEFAULT_EXCLUDE_SITES),
+         "exclude_addrs": [], "set_mtime": False, "ignore_mtime": False, "temp_folder": "",
+         "show_start": True, "start_queue_only": False, "show_final_later": True, "show_final_batch": True,
+         "dup_action": "ask", "manual_ua": UA, "progress_ui": dict(DEFAULT_PROGRESS_UI),
+         "antivirus": dict(DEFAULT_AV)}
     try:
         with open(CFG, encoding="utf-8") as f:
             j = json.load(f)
@@ -187,7 +224,8 @@ def load_cfg():
                 exts = info.get("exts")
                 exts = exts if isinstance(exts, list) else []
                 cats[str(name)] = {"folder": os.path.normpath(info["folder"]),
-                                   "exts": [str(e).lower().lstrip(".") for e in exts]}
+                                   "exts": [str(e).lower().lstrip(".") for e in exts],
+                                   "remember": bool(info.get("remember"))}
         if cats:
             s["categories"] = cats
         s["recent"] = [p for p in (j.get("recent") or []) if isinstance(p, str)][:10]
@@ -215,6 +253,44 @@ def load_cfg():
                 if key in sc and type(sc[key]) == type(default):
                     s["schedule"][key] = sc[key]
             s["schedule"]["days"] = [d for d in s["schedule"]["days"] if isinstance(d, int) and 0 <= d <= 6]
+        for key in ("clip_auto", "set_mtime", "ignore_mtime", "show_start", "start_queue_only",
+                    "show_final_later", "show_final_batch"):
+            if key in j:
+                s[key] = bool(j[key])
+        if isinstance(j.get("temp_folder"), str):
+            s["temp_folder"] = j["temp_folder"].strip()
+        if j.get("dup_action") in [a for a, _ in DUP_ACTIONS]:
+            s["dup_action"] = j["dup_action"]
+        for key in ("manual_ua", "menu_title"):
+            if isinstance(j.get(key), str) and j[key].strip():
+                s[key] = j[key].strip()
+        for key in ("capture_exts", "exclude_sites", "exclude_addrs"):
+            if isinstance(j.get(key), list):
+                s[key] = [str(x).strip() for x in j[key] if str(x).strip()]
+        for key, default in (("menu", DEFAULT_MENU), ("progress_ui", DEFAULT_PROGRESS_UI)):
+            if isinstance(j.get(key), dict):
+                for k in default:
+                    if k in j[key]:
+                        s[key][k] = bool(j[key][k])
+        ks = j.get("keys")
+        if isinstance(ks, dict):
+            for k in ("prevent", "force"):
+                if ks.get(k) in KEY_CHOICES:
+                    s["keys"][k] = ks[k]
+        av = j.get("antivirus")
+        if isinstance(av, dict):
+            s["antivirus"]["enabled"] = bool(av.get("enabled"))
+            for k in ("program", "args"):
+                if isinstance(av.get(k), str):
+                    s["antivirus"][k] = av[k]
+        br = j.get("browsers")
+        if isinstance(br, list):
+            out = [{"name": b["name"], "ua": b["ua"].strip(), "on": bool(b.get("on", True)),
+                    "builtin": bool(b.get("builtin"))}
+                   for b in br if isinstance(b, dict) and isinstance(b.get("name"), str)
+                   and isinstance(b.get("ua"), str) and b["ua"].strip()]
+            if out:
+                s["browsers"] = out
     except Exception:
         pass
     return s
@@ -248,7 +324,8 @@ def category_for(name, cats):
 
 
 # ---------- janela principal: colunas, ícones e constantes ----------
-GLOBAL = {"kbps": 0, "next": 0.0}   # limite de velocidade TOTAL (todos os downloads somados)
+GLOBAL = {"kbps": 0, "next": 0.0,   # limite de velocidade TOTAL (todos os downloads somados)
+          "ua": UA, "temp": "", "set_mtime": False, "ignore_mtime": False}   # opções que o motor lê
 GLOBAL_LOCK = threading.Lock()
 
 # id, título, largura, alinhamento, visível por padrão (a coluna "Nome do arquivo" é sempre visível)
@@ -364,6 +441,10 @@ class PixelIcons:
         return img
 
 
+class FileChanged(Exception):
+    """O arquivo no servidor mudou (data de modificação diferente) ao retomar um download."""
+
+
 class Download:
     def __init__(self, url, folder, conns=8, headers=None):
         self.url, self.folder, self.conns = url, folder, conns
@@ -371,6 +452,8 @@ class Download:
         self.name = self.path = self.size = None
         self.resumable = False
         self.probed = False  # já consultou tamanho/Range no servidor?
+        self.part_path = None          # arquivo parcial na pasta temporária (None = ao lado do destino)
+        self.last_modified = ""         # cabeçalho Last-Modified do servidor
         self.description = self.category = ""
         self.segs = []  # cada segmento: [inicio, fim, posicao_atual]
         self.status, self.error = "Na fila", ""
@@ -397,7 +480,7 @@ class Download:
         j = {k: getattr(self, k) for k in
              ("url", "folder", "conns", "name", "path", "size", "resumable", "segs", "status",
               "headers", "probed", "description", "category", "show_msg", "limit_remember",
-              "queued", "added", "last_try")}
+              "queued", "added", "last_try", "part_path", "last_modified")}
         # o limite só é guardado se o usuário marcou "Lembrar configurações de velocidade"
         j["limit_kbps"] = self.limit_kbps if self.limit_remember else 0
         return j
@@ -414,6 +497,8 @@ class Download:
         o.show_msg = d.get("show_msg") if isinstance(d.get("show_msg"), bool) else None
         o.limit_remember = bool(d.get("limit_remember"))
         o.queued = bool(d.get("queued"))
+        o.part_path = d.get("part_path") if isinstance(d.get("part_path"), str) else None
+        o.last_modified = d.get("last_modified") if isinstance(d.get("last_modified"), str) else ""
         for k in ("added", "last_try"):
             try:
                 setattr(o, k, float(d.get(k) or 0))
@@ -429,7 +514,7 @@ class Download:
 
     @property
     def part(self):
-        return self.path + ".part"
+        return self.part_path or (self.path + ".part")
 
     @property
     def downloaded(self):
@@ -485,6 +570,7 @@ class Download:
             except OSError:
                 pass
         self.segs, self.error, self.failed = [], "", False
+        self.part_path, self.last_modified = None, ""   # recalcula com as opções atuais
         self.probed, self.speed = False, 0.0   # consulta o servidor de novo (o arquivo pode ter mudado)
         self.status = "Na fila"
 
@@ -495,6 +581,31 @@ class Download:
                          for i in range(n)]
         else:
             self.segs = [[0, self.size - 1 if self.size else -1, 0]]
+
+    def _pick_part(self):
+        """Define onde fica o arquivo parcial: na pasta temporária das Opções (se houver) ou ao lado do destino.
+        Parciais já existentes ao lado do destino (versões antigas) continuam onde estão."""
+        if self.part_path:
+            os.makedirs(os.path.dirname(self.part_path), exist_ok=True)
+            return
+        tmp = GLOBAL.get("temp")
+        if tmp and not os.path.exists(self.path + ".part"):
+            os.makedirs(tmp, exist_ok=True)
+            tag = hashlib.sha1(self.path.encode("utf-8", "ignore")).hexdigest()[:10]
+            self.part_path = os.path.join(tmp, f"{tag}_{os.path.basename(self.path)}.part")
+
+    def _finalize(self):
+        """Move o parcial para o destino (funciona entre discos) e aplica a data do servidor, se pedido."""
+        try:
+            os.replace(self.part, self.path)
+        except OSError:
+            shutil.move(self.part, self.path)
+        if GLOBAL.get("set_mtime") and self.last_modified:
+            try:
+                t = parsedate_to_datetime(self.last_modified).timestamp()
+                os.utime(self.path, (t, t))
+            except Exception:
+                pass
 
     def _run(self):
         try:
@@ -509,8 +620,10 @@ class Download:
                 self.probed = True
             if not self.path:
                 self.path = unique_path(self.folder, self.name)
+            self._pick_part()
             fresh = not os.path.exists(self.part)
             if fresh or not self.segs or not self.resumable:
+                self.last_modified = ""
                 self._build_segments()
                 with open(self.part, "wb") as f:
                     if self.size:
@@ -530,7 +643,7 @@ class Download:
             elif self.stop.is_set():
                 self.status = "Pausado"
             else:
-                os.replace(self.part, self.path)
+                self._finalize()
                 self.last_try = time.time()
                 self.status = "Concluído"
         except Exception as ex:
@@ -610,6 +723,13 @@ class Download:
                     if self.resumable:
                         h["Range"] = f"bytes={seg[2]}-{seg[1] if seg[1] >= 0 else ''}"
                     with urllib.request.urlopen(req(self.url, h), timeout=20) as r:
+                        lm = r.headers.get("Last-Modified")
+                        if lm:
+                            if self.last_modified and lm != self.last_modified and not GLOBAL.get("ignore_mtime"):
+                                raise FileChanged("O arquivo mudou no servidor desde o início do download. Use "
+                                                  "\"Baixar novamente\" ou ative \"Ignorar mudanças de horário "
+                                                  "do arquivo\" nas Opções.")
+                            self.last_modified = self.last_modified or lm
                         if self.resumable and r.status != 206:
                             raise IOError("Servidor ignorou o pedido de Range")
                         st[id(seg)] = "Recebendo..."
@@ -640,6 +760,10 @@ class Download:
                             st[id(seg)] = "Concluído"
                             return True  # tamanho desconhecido: EOF = fim
                         raise IOError("Conexão encerrada antes do fim")
+                except FileChanged as ex:
+                    self.error, self.failed = str(ex), True
+                    st[id(seg)] = "Erro"
+                    return False
                 except Exception as ex:
                     tries += 1
                     st[id(seg)] = f"Reconectando ({tries})..."
@@ -657,6 +781,53 @@ class Download:
 PORT = 9614
 INBOX = queue.Queue()
 TRAY_EVENTS = queue.Queue()  # eventos do menu da bandeja (vêm de outra thread)
+
+
+def detect_browser(ua, browsers):
+    """Identifica o navegador pelo User-Agent (primeiro que combinar, na ordem da lista)."""
+    ua = (ua or "").lower()
+    for b in browsers:
+        if b["ua"].lower() in ua:
+            return b
+    return None
+
+
+def _match(value, patterns, prefix=False):
+    for pat in patterns:
+        pat = pat.strip().lower()
+        if not pat:
+            continue
+        if prefix and not any(c in pat for c in "*?"):
+            pat += "*"
+        if fnmatch.fnmatchcase(value, pat):
+            return True
+    return False
+
+
+def capture_decision(s, url, filename="", ua="", mods="", manual=False):
+    """Decide se um link enviado pela extensão deve ser capturado pelo PyDM. Retorna (aceito, motivo).
+    Se não for aceito, a Bridge responde 409 e a extensão deixa o navegador baixar normalmente."""
+    if manual:                       # "Baixar com PyDM" no menu de contexto: sempre baixa
+        return True, ""
+    b = detect_browser(ua, s["browsers"])
+    if b and not b["on"]:
+        return False, "navegador desativado"
+    keys = s["keys"]
+    if mods and keys["prevent"] != "Nenhuma" and mods == keys["prevent"]:
+        return False, "tecla de bloqueio"
+    if mods and keys["force"] != "Nenhuma" and mods == keys["force"]:
+        return True, ""              # tecla de forçar: ignora os filtros abaixo
+    p = urllib.parse.urlparse(url)
+    if _match((p.hostname or "").lower(), s["exclude_sites"]):
+        return False, "site excluído"
+    if _match(url.lower(), s["exclude_addrs"], prefix=True):
+        return False, "endereço excluído"
+    name = filename or urllib.parse.unquote(os.path.basename(p.path))
+    ext = os.path.splitext(name)[1].lstrip(".").upper()
+    # sem extensão, ou página dinâmica (download.php, get.aspx...): o nome real vem do servidor, então captura
+    if ext and ext not in DYNAMIC_EXTS and not any(fnmatch.fnmatchcase(ext, pat.upper()) for pat in s["capture_exts"]):
+        return False, "tipo de arquivo"
+    return True, ""
 
 
 class Bridge(BaseHTTPRequestHandler):
@@ -687,6 +858,11 @@ class Bridge(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._allowed():
             return self._send(403)
+        s = SETTINGS_REF["s"] or {}
+        if self.path.split("?")[0] == "/config":   # a extensão monta o menu de contexto com isto
+            return self._send(200, {"app": "PyDM", "version": 1,
+                                    "title": s.get("menu_title") or DEFAULT_MENU_TITLE,
+                                    "menu": s.get("menu") or DEFAULT_MENU})
         self._send(200, {"app": "PyDM", "version": 1})
 
     def do_POST(self):
@@ -708,6 +884,12 @@ class Bridge(BaseHTTPRequestHandler):
             for k, key in (("referrer", "Referer"), ("cookie", "Cookie"), ("userAgent", "User-Agent")):
                 if clean(j.get(k)):
                     h[key] = clean(j.get(k))
+            s = SETTINGS_REF["s"]
+            if s:
+                ok, why = capture_decision(s, url, clean(j.get("filename")), clean(j.get("userAgent")),
+                                           clean(j.get("mods")), bool(j.get("manual")))
+                if not ok:
+                    return self._send(409, {"ok": False, "ignored": why})
             INBOX.put({"url": url, "headers": h})
             self._send(200, {"ok": True})
         except Exception:
@@ -732,6 +914,61 @@ def already_running():
             return json.loads(resp.read()).get("app") == "PyDM"
     except Exception:
         return False
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_cmd():
+    """Comando gravado no registro: abre o PyDM direto na bandeja."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    exe = sys.executable
+    pw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.exists(pw):
+        exe = pw
+    return f'"{exe}" "{os.path.abspath(__file__)}" --tray'
+
+
+def autostart_get():
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, "PyDM")
+        return True
+    except Exception:
+        return False
+
+
+def autostart_set(on):
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if on:
+                winreg.SetValueEx(k, "PyDM", 0, winreg.REG_SZ, autostart_cmd())
+            else:
+                try:
+                    winreg.DeleteValue(k, "PyDM")
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as ex:
+        log(f"Início automático: {ex!r}")
+        return False
+
+
+def default_av_program():
+    """Procura o Windows Defender (MpCmdRun.exe) para usar como verificador padrão."""
+    if not sys.platform.startswith("win"):
+        return ""
+    cands = [os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Windows Defender", "MpCmdRun.exe")]
+    cands += sorted(glob.glob(os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "Microsoft",
+                                           "Windows Defender", "Platform", "*", "MpCmdRun.exe")), reverse=True)
+    return next((c for c in cands if os.path.exists(c)), "")
 
 
 def make_tray_image():
@@ -771,7 +1008,7 @@ class InfoDialog:
         self.cat_var = tk.StringVar(value=cat)
         self.path_var = tk.StringVar()
         self.folder_var = tk.StringVar()
-        self.remember = tk.BooleanVar(value=False)
+        self.remember = tk.BooleanVar(value=bool(self.cats[cat].get("remember")))
         self.desc_var = tk.StringVar()
         self.size_var = tk.StringVar(value="Obtendo...")
         self.path_var.set(os.path.join(self.cats[cat]["folder"], self.guess))
@@ -899,6 +1136,7 @@ class InfoDialog:
                     os.path.normpath(folder) == os.path.normpath(self.cats[self.cat_var.get()]["folder"])):
                 cat = category_for(name, self.cats)
                 self.cat_var.set(cat)
+                self.remember.set(bool(self.cats[cat].get("remember")))
                 folder = self.cats[cat]["folder"]
             self.path_var.set(os.path.join(folder, name))
         self.draw_icon(os.path.basename(self.path_var.get()))
@@ -930,6 +1168,7 @@ class InfoDialog:
         if cat not in self.cats:
             return
         self.cat_touched = True
+        self.remember.set(bool(self.cats[cat].get("remember")))
         name = os.path.basename(self.path_var.get())
         self.path_var.set(os.path.join(self.cats[cat]["folder"], name))
         self.sync_folder()
@@ -974,15 +1213,19 @@ class InfoDialog:
         if not folder:
             folder = self.cats.get(cat, {}).get("folder", DEFAULT_FOLDER)
         path = os.path.join(os.path.abspath(os.path.expanduser(folder)), name)
-        if self.app.register(self.win, self.url, self.headers, path, cat, self.desc_var.get().strip(),
-                             self.info, self.remember.get(), start):
+        ok = self.app.register(self.win, self.url, self.headers, path, cat, self.desc_var.get().strip(),
+                               self.info, self.remember.get(), start)
+        if ok:
             self.win.destroy()
+        return ok
 
     def start(self):
         self.commit(True)
 
     def later(self):
-        self.commit(False)
+        if self.commit(False) and self.app.settings["show_final_later"]:
+            messagebox.showinfo("PyDM", "O download foi adicionado à fila principal.\n"
+                                        "Use \"Iniciar fila\" quando quiser baixar.", parent=self.app.root)
 
     def cancel(self):
         self.win.destroy()
@@ -1085,8 +1328,11 @@ class ProgressDialog:
             tk.Label(box, text=txt, bg="white", anchor="w").grid(row=i, column=0, sticky="w")
             tk.Label(box, textvariable=self.v[key], bg="white", anchor="w").grid(row=i, column=1, sticky="w")
 
-        self.build_speed_tab()
-        self.build_done_tab()
+        ui = app.settings["progress_ui"]
+        if ui["speed_tab"]:
+            self.build_speed_tab()
+        if ui["done_tab"]:
+            self.build_done_tab()
 
         self.bar = ttk.Progressbar(f, maximum=100)
         self.bar.pack(fill="x", pady=10)
@@ -1116,6 +1362,8 @@ class ProgressDialog:
         self.tbl.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
+        if not ui["details"]:
+            self.toggle_details()
         self.refresh()
         center_front(win, offset=26 * (len(app.progress) % 6))
 
@@ -1675,11 +1923,15 @@ class BatchDialog:
         folder = self.folder.get().strip() if self.where.get() == "custom" else None
         n = self.app.add_batch(urls, folder, self.start.get())
         self.win.destroy()
+        skipped = len(lines) - len(urls)
         if n == 0:
             messagebox.showinfo("PyDM", "Todos os endereços já estavam na lista.", parent=self.app.root)
-        elif len(urls) < len(lines):
-            messagebox.showinfo("PyDM", f"{len(lines) - len(urls)} linha(s) sem endereço válido foram ignoradas.",
-                                parent=self.app.root)
+        else:
+            msg = f"{n} download(s) " + ("iniciado(s)." if self.start.get() else "adicionado(s) à fila principal.")
+            if skipped:
+                msg += f"\n{skipped} linha(s) sem endereço válido foram ignoradas."
+            if self.app.settings["show_final_batch"] or skipped:
+                messagebox.showinfo("PyDM", msg, parent=self.app.root)
 
 
 class PropertiesDialog:
@@ -1727,45 +1979,537 @@ class PropertiesDialog:
         self.win.destroy()
 
 
+class SubDialog:
+    """Base das pequenas janelas abertas a partir das Opções: modal, centralizada, com OK/Cancelar."""
+
+    def __init__(self, parent, title, padding=12):
+        win = self.win = tk.Toplevel(parent)
+        win.title(title)
+        win.transient(parent)
+        win.resizable(False, False)
+        self.f = ttk.Frame(win, padding=padding)
+        self.f.pack(fill="both", expand=True)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def buttons(self):
+        bf = ttk.Frame(self.f)
+        bf.pack(pady=(12, 0))
+        ttk.Button(bf, text="OK", width=12, command=self.ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancelar", width=12, command=self.win.destroy).pack(side="left", padx=6)
+        center_front(self.win)
+        try:
+            self.win.grab_set()
+        except tk.TclError:
+            pass
+
+    def ok(self):
+        self.win.destroy()
+
+
+class AddressListDialog(SubDialog):
+    """Lista de endereços (um por linha) que o PyDM não deve baixar automaticamente."""
+
+    def __init__(self, parent, items, on_ok):
+        super().__init__(parent, "Endereços que não devem iniciar o download automaticamente")
+        self.on_ok = on_ok
+        ttk.Label(self.f, justify="left",
+                  text="Um endereço por linha. Use * e ? como curinga.\n"
+                       "Sem curinga, vale como início do endereço (ex.: https://exemplo.com/privado/).").pack(anchor="w")
+        tf = ttk.Frame(self.f)
+        tf.pack(fill="both", expand=True, pady=(6, 0))
+        self.txt = tk.Text(tf, width=64, height=12, wrap="none", undo=True)
+        sb = ttk.Scrollbar(tf, command=self.txt.yview)
+        self.txt.configure(yscrollcommand=sb.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.txt.insert("1.0", "\n".join(items))
+        self.buttons()
+
+    def ok(self):
+        self.on_ok([l.strip() for l in self.txt.get("1.0", "end").splitlines() if l.strip()])
+        self.win.destroy()
+
+
+class KeysDialog(SubDialog):
+    """Teclas que o usuário segura ao clicar num link para impedir ou forçar a captura pelo PyDM."""
+
+    def __init__(self, parent, keys, on_ok):
+        super().__init__(parent, "Teclas para impedir/forçar downloads")
+        self.on_ok = on_ok
+        self.v_prevent = tk.StringVar(value=keys["prevent"])
+        self.v_force = tk.StringVar(value=keys["force"])
+        ttk.Label(self.f, justify="left",
+                  text="Segure a tecla enquanto clica no link no navegador.\n"
+                       "Funciona com a extensão do PyDM instalada.").pack(anchor="w", pady=(0, 8))
+        for text, var in (("Impedir o PyDM de baixar (o navegador baixa):", self.v_prevent),
+                          ("Forçar o PyDM a baixar (ignora tipos de arquivo e sites excluídos):", self.v_force)):
+            ttk.Label(self.f, text=text).pack(anchor="w", pady=(6, 2))
+            ttk.Combobox(self.f, textvariable=var, values=KEY_CHOICES, state="readonly", width=16).pack(anchor="w")
+        self.buttons()
+
+    def ok(self):
+        p, fo = self.v_prevent.get(), self.v_force.get()
+        if p == fo and p != "Nenhuma":
+            messagebox.showerror("Teclas", "Impedir e forçar não podem usar a mesma combinação.", parent=self.win)
+            return
+        self.on_ok({"prevent": p, "force": fo})
+        self.win.destroy()
+
+
+class ContextMenuDialog(SubDialog):
+    """Quais itens 'Baixar com PyDM' aparecem no menu de clique direito do navegador."""
+
+    def __init__(self, parent, menu, title, on_ok):
+        super().__init__(parent, "Menu de contexto do navegador")
+        self.on_ok = on_ok
+        self.v_title = tk.StringVar(value=title)
+        self.vars = {k: tk.BooleanVar(value=bool(menu.get(k))) for k, _ in MENU_LABELS}
+        r = ttk.Frame(self.f)
+        r.pack(fill="x")
+        ttk.Label(r, text="Texto do item:").pack(side="left")
+        ttk.Entry(r, textvariable=self.v_title, width=30).pack(side="left", padx=8)
+        lf = ttk.LabelFrame(self.f, text="Mostrar o item ao clicar com o botão direito em", padding=8)
+        lf.pack(fill="x", pady=10)
+        for k, label in MENU_LABELS:
+            ttk.Checkbutton(lf, text=label, variable=self.vars[k]).pack(anchor="w", pady=1)
+        ttk.Label(self.f, justify="left", foreground="#555555",
+                  text="A extensão atualiza o menu em até 1 minuto\n(ou ao reiniciar o navegador).").pack(anchor="w")
+        self.buttons()
+
+    def ok(self):
+        self.on_ok({k: bool(v.get()) for k, v in self.vars.items()}, self.v_title.get().strip() or DEFAULT_MENU_TITLE)
+        self.win.destroy()
+
+
+class ProgressCustomDialog(SubDialog):
+    """Personaliza a janela 'Progresso do download'."""
+
+    def __init__(self, parent, ui, on_ok):
+        super().__init__(parent, 'Customizar diálogo "Progresso de download"')
+        self.on_ok = on_ok
+        self.vars = {}
+        ttk.Label(self.f, text="A janela de progresso deve mostrar:").pack(anchor="w", pady=(0, 6))
+        for k, label in (("speed_tab", 'Aba "Limitar velocidade"'), ("done_tab", 'Aba "Opções ao concluir"'),
+                         ("details", "Detalhes das conexões já abertos (barra e tabela de conexões)")):
+            self.vars[k] = tk.BooleanVar(value=bool(ui.get(k, True)))
+            ttk.Checkbutton(self.f, text=label, variable=self.vars[k]).pack(anchor="w", pady=2)
+        ttk.Label(self.f, text="Vale para as próximas janelas de progresso.", foreground="#555555").pack(
+            anchor="w", pady=(8, 0))
+        self.buttons()
+
+    def ok(self):
+        self.on_ok({k: bool(v.get()) for k, v in self.vars.items()})
+        self.win.destroy()
+
+
+class AntivirusDialog(SubDialog):
+    """Verificação contra vírus: roda um programa externo no arquivo assim que o download termina."""
+
+    def __init__(self, parent, av, on_ok):
+        super().__init__(parent, "Configurar verificação contra vírus")
+        self.on_ok = on_ok
+        self.v_on = tk.BooleanVar(value=bool(av["enabled"]))
+        self.v_prog = tk.StringVar(value=av["program"])
+        self.v_args = tk.StringVar(value=av["args"])
+        ttk.Checkbutton(self.f, text="Verificar o arquivo contra vírus quando o download terminar",
+                        variable=self.v_on).pack(anchor="w")
+        ttk.Label(self.f, text="Programa antivírus (linha de comando):").pack(anchor="w", pady=(10, 2))
+        r = ttk.Frame(self.f)
+        r.pack(fill="x")
+        ttk.Entry(r, textvariable=self.v_prog, width=60).pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="...", width=3, command=self.browse).pack(side="left", padx=(6, 0))
+        found = default_av_program()
+        ttk.Label(self.f, foreground="#555555",
+                  text="Em branco = " + (f"Windows Defender ({found})" if found else "nenhum encontrado")).pack(anchor="w")
+        ttk.Label(self.f, text="Parâmetros ({file} = caminho do arquivo baixado):").pack(anchor="w", pady=(10, 2))
+        ttk.Entry(self.f, textvariable=self.v_args, width=64).pack(fill="x")
+        ttk.Button(self.f, text="Padrão (Windows Defender)",
+                   command=lambda: (self.v_prog.set(""), self.v_args.set(DEFAULT_AV["args"]))).pack(anchor="e", pady=(8, 0))
+        self.buttons()
+
+    def browse(self):
+        p = filedialog.askopenfilename(parent=self.win, title="Programa antivírus",
+                                       filetypes=[("Programas", "*.exe"), ("Todos os arquivos", "*.*")])
+        if p:
+            self.v_prog.set(os.path.normpath(p))
+
+    def ok(self):
+        self.on_ok({"enabled": bool(self.v_on.get()), "program": self.v_prog.get().strip(),
+                    "args": self.v_args.get().strip() or DEFAULT_AV["args"]})
+        self.win.destroy()
+
+
 class OptionsDialog:
-    """Opções gerais: conexões, downloads simultâneos, limite de velocidade total e categorias."""
+    """Opções (organizadas como no IDM): Geral, Tipos de arquivos, Salvar em, Downloads e Velocidade."""
 
     def __init__(self, app):
         self.app = app
         s = app.settings
+        # cópias de trabalho: só viram configuração de verdade em "Aplicar"/"OK"
         self.cats = copy.deepcopy(s["categories"])
+        self.browsers = copy.deepcopy(s["browsers"])
+        self.keys = dict(s["keys"])
+        self.menu, self.menu_title = dict(s["menu"]), s["menu_title"]
+        self.excl_addrs = list(s["exclude_addrs"])
+        self.prog_ui = dict(s["progress_ui"])
+        self.av = dict(s["antivirus"])
         win = self.win = tk.Toplevel(app.root)
         win.title("Opções")
         win.transient(app.root)
         win.resizable(False, False)
         nb = ttk.Notebook(win)
         nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        self.build_general(nb)
+        self.build_types(nb)
+        self.build_save(nb)
+        self.build_downloads(nb)
+        self.build_speed(nb)
 
-        # --- Geral ---
-        g = ttk.Frame(nb, padding=14)
+        bf = ttk.Frame(win)
+        bf.pack(pady=10)
+        ttk.Button(bf, text="OK", width=12, command=self.ok).pack(side="left", padx=6)
+        ttk.Button(bf, text="Cancelar", width=12, command=win.destroy).pack(side="left", padx=6)
+        ttk.Button(bf, text="Aplicar", width=12, command=self.apply).pack(side="left", padx=6)
+        win.bind("<Escape>", lambda e: win.destroy())
+        center_front(win)
+
+    # ================= aba Geral =================
+    def build_general(self, nb):
+        app, s = self.app, self.app.settings
+        g = ttk.Frame(nb, padding=12)
         nb.add(g, text="Geral")
         self.v_conns = tk.IntVar(value=s["conns"])
         self.v_max = tk.IntVar(value=s["max_active"])
         self.v_clip = tk.BooleanVar(value=app.clip_var.get())
-        self.v_notify = tk.BooleanVar(value=app.notify_var.get())
+        self.v_clip_auto = tk.BooleanVar(value=s["clip_auto"])
         self.v_tray = tk.BooleanVar(value=s["close_to_tray"])
-        r = ttk.Frame(g)
-        r.pack(anchor="w", pady=3)
-        ttk.Label(r, text="Conexões por download:", width=28).pack(side="left")
-        ttk.Spinbox(r, from_=1, to=32, width=5, textvariable=self.v_conns).pack(side="left")
-        r = ttk.Frame(g)
-        r.pack(anchor="w", pady=3)
-        ttk.Label(r, text="Downloads simultâneos:", width=28).pack(side="left")
-        ttk.Spinbox(r, from_=1, to=10, width=5, textvariable=self.v_max).pack(side="left")
-        ttk.Checkbutton(g, text="Monitorar a área de transferência (perguntar ao copiar um link)",
-                        variable=self.v_clip).pack(anchor="w", pady=(12, 3))
-        ttk.Checkbutton(g, text="Mostrar a mensagem \"Download completo\" ao concluir",
-                        variable=self.v_notify).pack(anchor="w", pady=3)
-        ttk.Checkbutton(g, text="Ao fechar a janela, continuar na bandeja do sistema" +
-                        ("" if app.tray else "  (indisponível: sem pystray/pillow)"),
-                        variable=self.v_tray, state="normal" if app.tray else "disabled").pack(anchor="w", pady=3)
+        self.v_auto = tk.BooleanVar(value=autostart_get())
+        self.v_auto0 = self.v_auto.get()
 
-        # --- Velocidade ---
+        for txt, var, hi in (("Conexões por download:", self.v_conns, 32), ("Downloads simultâneos:", self.v_max, 10)):
+            r = ttk.Frame(g)
+            r.pack(anchor="w", pady=2)
+            ttk.Label(r, text=txt, width=28).pack(side="left")
+            ttk.Spinbox(r, from_=1, to=hi, width=5, textvariable=var).pack(side="left")
+
+        lf = ttk.LabelFrame(g, text="Navegador / integração com o sistema", padding=8)
+        lf.pack(fill="x", pady=(8, 4))
+        r = ttk.Frame(lf)
+        r.pack(fill="x")
+        self.lbl_bridge = ttk.Label(r, text=self.bridge_text())
+        self.lbl_bridge.pack(side="left")
+        ttk.Button(r, text="Reiniciar", command=self.restart_bridge).pack(side="right")
+        ttk.Checkbutton(lf, text="Iniciar o PyDM automaticamente com o Windows (direto na bandeja)",
+                        variable=self.v_auto,
+                        state="normal" if sys.platform.startswith("win") else "disabled").pack(anchor="w", pady=(6, 1))
+        ttk.Checkbutton(lf, text="Monitorar a área de transferência (perguntar ao copiar um link)",
+                        variable=self.v_clip, command=self.clip_state).pack(anchor="w", pady=1)
+        self.cb_clip_auto = ttk.Checkbutton(lf, text="Iniciar download automático de URLs da área de transferência",
+                                            variable=self.v_clip_auto)
+        self.cb_clip_auto.pack(anchor="w", padx=(22, 0), pady=1)
+        ttk.Checkbutton(lf, text="Ao fechar a janela, continuar na bandeja do sistema" +
+                        ("" if app.tray else "  (indisponível: sem pystray/pillow)"),
+                        variable=self.v_tray, state="normal" if app.tray else "disabled").pack(anchor="w", pady=1)
+        self.clip_state()
+
+        bf = ttk.LabelFrame(g, text="Capturar downloads nos seguintes navegadores:", padding=6)
+        bf.pack(fill="x", pady=4)
+        tf = ttk.Frame(bf)
+        tf.pack(fill="x")
+        self.bt = ttk.Treeview(tf, show="tree", height=4, selectmode="browse")
+        sb = ttk.Scrollbar(tf, orient="vertical", command=self.bt.yview)
+        self.bt.configure(yscrollcommand=sb.set)
+        self.bt.pack(side="left", fill="x", expand=True)
+        sb.pack(side="right", fill="y")
+        self.bt.bind("<Button-1>", lambda e: self.toggle_browser(self.bt.identify_row(e.y)))
+        self.bt.bind("<space>", lambda e: self.toggle_browser((self.bt.selection() or [""])[0]))
+        self.fill_browsers()
+        r = ttk.Frame(bf)
+        r.pack(fill="x", pady=(6, 0))
+        ttk.Label(r, text="O navegador é identificado pelo User-Agent.", foreground="#555555").pack(side="left")
+        ttk.Button(r, text="Remover", command=self.del_browser).pack(side="right", padx=(6, 0))
+        ttk.Button(r, text="Adic. navegador...", command=self.add_browser).pack(side="right")
+
+        for txt, cmd, label in (("Usar teclas para impedir/forçar downloads com o PyDM", self.edit_keys, "Teclas..."),
+                                ("Personalizar o menu de contexto do PyDM no navegador", self.edit_menu, "Editar...")):
+            r = ttk.Frame(g)
+            r.pack(fill="x", pady=3)
+            ttk.Label(r, text=txt).pack(side="left")
+            ttk.Button(r, text=label, width=12, command=cmd).pack(side="right")
+
+    def bridge_text(self):
+        return (f"Integração com o navegador ativa (porta {PORT})" if self.app.bridge
+                else f"Integração indisponível (porta {PORT} em uso)")
+
+    def restart_bridge(self):
+        ok = self.app.restart_bridge()
+        self.lbl_bridge.configure(text=self.bridge_text())
+        if not ok:
+            messagebox.showwarning("PyDM", f"Não foi possível abrir a porta {PORT}.\n"
+                                           "Feche o outro programa que a usa e tente de novo.", parent=self.win)
+
+    def clip_state(self):
+        self.cb_clip_auto.configure(state="normal" if self.v_clip.get() else "disabled")
+
+    # ---------- navegadores ----------
+    def fill_browsers(self):
+        self.bt.delete(*self.bt.get_children())
+        for i, b in enumerate(self.browsers):
+            self.bt.insert("", "end", iid=str(i), text=self.browser_text(b))
+
+    @staticmethod
+    def browser_text(b):
+        return ("\u2611  " if b["on"] else "\u2610  ") + b["name"]
+
+    def toggle_browser(self, iid):
+        if not iid:
+            return
+        b = self.browsers[int(iid)]
+        b["on"] = not b["on"]
+        self.bt.item(iid, text=self.browser_text(b))
+
+    def add_browser(self):
+        name = simpledialog.askstring("Adicionar navegador", "Nome do navegador:", parent=self.win)
+        name = (name or "").strip()
+        if not name:
+            return
+        ua = simpledialog.askstring("Adicionar navegador",
+                                    "Trecho do User-Agent que identifica este navegador\n"
+                                    "(ex.: Brave e Vivaldi usam o mesmo User-Agent do Chrome e não dá para separá-los):",
+                                    parent=self.win)
+        ua = (ua or "").strip()
+        if not ua:
+            return
+        self.browsers.insert(0, {"name": name, "ua": ua, "on": True, "builtin": False})  # custom: testado primeiro
+        self.fill_browsers()
+
+    def del_browser(self):
+        sel = self.bt.selection()
+        if not sel:
+            return
+        if self.browsers[int(sel[0])].get("builtin"):
+            messagebox.showinfo("PyDM", "Só os navegadores adicionados por você podem ser removidos.", parent=self.win)
+            return
+        del self.browsers[int(sel[0])]
+        self.fill_browsers()
+
+    def edit_keys(self):
+        KeysDialog(self.win, self.keys, lambda k: self.keys.update(k))
+
+    def edit_menu(self):
+        def done(menu, title):
+            self.menu, self.menu_title = menu, title
+        ContextMenuDialog(self.win, self.menu, self.menu_title, done)
+
+    # ================= aba Tipos de arquivos =================
+    def build_types(self, nb):
+        s = self.app.settings
+        t = ttk.Frame(nb, padding=12)
+        nb.add(t, text="Tipos de arquivos")
+        ttk.Label(t, text="Iniciar download com os seguintes tipos de arquivos:").pack(anchor="w")
+        self.txt_exts = tk.Text(t, width=64, height=6, wrap="word")
+        self.txt_exts.pack(fill="x", pady=(3, 0))
+        self.txt_exts.insert("1.0", " ".join(s["capture_exts"]))
+        ttk.Button(t, text="Padrão", width=10,
+                   command=lambda: self.set_text(self.txt_exts, DEFAULT_CAPTURE_EXTS)).pack(anchor="e", pady=4)
+
+        ttk.Label(t, text="Não iniciar automaticamente o download dos seguintes sites:").pack(anchor="w", pady=(8, 0))
+        self.txt_sites = tk.Text(t, width=64, height=4, wrap="word")
+        self.txt_sites.pack(fill="x", pady=(3, 0))
+        self.txt_sites.insert("1.0", " ".join(s["exclude_sites"]))
+        r = ttk.Frame(t)
+        r.pack(fill="x", pady=4)
+        ttk.Label(r, text="(separar nomes com espaços; * e ? são curingas)").pack(side="left")
+        ttk.Button(r, text="Padrão", width=10,
+                   command=lambda: self.set_text(self.txt_sites, DEFAULT_EXCLUDE_SITES)).pack(side="right")
+
+        ttk.Label(t, text="Não iniciar o download automaticamente dos seguintes endereços:").pack(anchor="w", pady=(8, 4))
+        ttk.Button(t, text="Editar lista ...", width=18, command=self.edit_addrs).pack(anchor="w")
+        ttk.Label(t, foreground="#555555", justify="left",
+                  text="Estes filtros valem para os downloads capturados pelo navegador.\n"
+                       "\"Baixar com PyDM\" (menu de contexto) e a tecla de forçar sempre baixam.\n"
+                       "Links sem extensão ou de página dinâmica (ex.: download.php) são capturados."
+                  ).pack(anchor="w", pady=(14, 0))
+
+    @staticmethod
+    def set_text(widget, words):
+        widget.delete("1.0", "end")
+        widget.insert("1.0", " ".join(words))
+
+    @staticmethod
+    def words(widget, upper=False):
+        out = [w for w in re.split(r"[\s,;]+", widget.get("1.0", "end")) if w]
+        return [w.upper() for w in out] if upper else out
+
+    def edit_addrs(self):
+        def done(items):
+            self.excl_addrs = items
+        AddressListDialog(self.win, self.excl_addrs, done)
+
+    # ================= aba Salvar em =================
+    def build_save(self, nb):
+        s = self.app.settings
+        c = ttk.Frame(nb, padding=12)
+        nb.add(c, text="Salvar em")
+        self.ct = ttk.Treeview(c, columns=("pasta", "exts"), show="tree headings", height=6, selectmode="browse")
+        for cid, t, w in (("#0", "Categoria", 110), ("pasta", "Pasta", 250), ("exts", "Extensões", 220)):
+            self.ct.heading(cid, text=t)
+            self.ct.column(cid, width=w, anchor="w")
+        self.ct.pack(fill="x")
+        self.ct.bind("<<TreeviewSelect>>", self.load_fields)
+        self.cur = None
+        self.v_folder, self.v_exts = tk.StringVar(), tk.StringVar()
+        self.v_remember = tk.BooleanVar()
+        r = ttk.Frame(c)
+        r.pack(fill="x", pady=(8, 2))
+        ttk.Label(r, text="Pasta:", width=11).pack(side="left")
+        ttk.Entry(r, textvariable=self.v_folder).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(r, text="...", width=3, command=self.browse).pack(side="left")
+        r = ttk.Frame(c)
+        r.pack(fill="x", pady=2)
+        ttk.Label(r, text="Extensões:", width=11).pack(side="left")
+        ttk.Entry(r, textvariable=self.v_exts).pack(side="left", fill="x", expand=True, padx=4)
+        self.chk_rem = ttk.Checkbutton(c, text="Lembrar a última pasta usada para esta categoria",
+                                       variable=self.v_remember)
+        self.chk_rem.pack(anchor="w", pady=(4, 0))
+        r = ttk.Frame(c)
+        r.pack(pady=(8, 0))
+        ttk.Button(r, text="Atualizar categoria", command=self.commit_fields).pack(side="left", padx=4)
+        ttk.Button(r, text="Nova categoria...", command=self.new_cat).pack(side="left", padx=4)
+        ttk.Button(r, text="Excluir categoria", command=self.del_cat).pack(side="left", padx=4)
+        self.fill_cats()
+
+        self.v_mtime = tk.BooleanVar(value=s["set_mtime"])
+        ttk.Checkbutton(c, text="Definir a data de criação do arquivo, assim como fornecida pelo servidor",
+                        variable=self.v_mtime).pack(anchor="w", pady=(12, 4))
+        lf = ttk.LabelFrame(c, text="Pasta temporária", padding=8)
+        lf.pack(fill="x", pady=4)
+        self.v_temp = tk.StringVar(value=s["temp_folder"])
+        r = ttk.Frame(lf)
+        r.pack(fill="x")
+        ttk.Entry(r, textvariable=self.v_temp).pack(side="left", fill="x", expand=True)
+        ttk.Button(r, text="Procurar", command=self.browse_temp).pack(side="left", padx=(6, 0))
+        ttk.Label(lf, foreground="#555555", justify="left",
+                  text="Os arquivos parciais (.part) ficam aqui enquanto baixam e vão para a pasta de\n"
+                       "destino ao concluir. Em branco = o parcial fica na própria pasta de destino.\n"
+                       "Vale para os próximos downloads (os em andamento continuam onde estão)."
+                  ).pack(anchor="w", pady=(6, 0))
+
+    def browse_temp(self):
+        p = filedialog.askdirectory(parent=self.win, initialdir=self.v_temp.get() or APP_DIR)
+        if p:
+            self.v_temp.set(os.path.normpath(p))
+
+    def fill_cats(self, select=None):
+        self.ct.delete(*self.ct.get_children())
+        for name, info in self.cats.items():
+            self.ct.insert("", "end", iid=name, text=name, values=(info["folder"], " ".join(info["exts"])))
+        first = select if select in self.cats else next(iter(self.cats), None)
+        if first:
+            self.ct.selection_set(first)
+
+    def load_fields(self, _e=None):
+        s = self.ct.selection()
+        self.cur = s[0] if s else None
+        if self.cur in self.cats:
+            info = self.cats[self.cur]
+            self.v_folder.set(info["folder"])
+            self.v_exts.set(" ".join(info["exts"]))
+            self.v_remember.set(bool(info.get("remember")))
+            self.chk_rem.configure(text=f'Lembrar a última pasta usada para a categoria "{self.cur}"')
+
+    def commit_fields(self):
+        if self.cur not in self.cats:
+            return
+        folder = self.v_folder.get().strip()
+        if folder:
+            self.cats[self.cur]["folder"] = os.path.normpath(folder)
+        self.cats[self.cur]["exts"] = [e.lower().lstrip(".") for e in re.split(r"[,\s;]+", self.v_exts.get()) if e.strip(". ")]
+        self.cats[self.cur]["remember"] = bool(self.v_remember.get())
+        self.fill_cats(self.cur)
+
+    def browse(self):
+        p = filedialog.askdirectory(parent=self.win, initialdir=self.v_folder.get() or DEFAULT_FOLDER)
+        if p:
+            self.v_folder.set(os.path.normpath(p))
+
+    def new_cat(self):
+        name = simpledialog.askstring("Nova categoria", "Nome da categoria:", parent=self.win)
+        name = (name or "").strip()
+        if not name:
+            return
+        if name in self.cats:
+            messagebox.showerror("Erro", "Já existe uma categoria com esse nome.", parent=self.win)
+            return
+        self.cats[name] = {"folder": os.path.join(DEFAULT_FOLDER, name), "exts": [], "remember": False}
+        self.fill_cats(name)
+
+    def del_cat(self):
+        if not self.cur or self.cur == "Geral" or len(self.cats) <= 1:
+            messagebox.showinfo("PyDM", 'A categoria "Geral" não pode ser excluída.', parent=self.win)
+            return
+        del self.cats[self.cur]
+        self.cur = None
+        self.fill_cats()
+
+    # ================= aba Downloads =================
+    def build_downloads(self, nb):
+        app, s = self.app, self.app.settings
+        d = ttk.Frame(nb, padding=12)
+        nb.add(d, text="Downloads")
+        self.v_notify = tk.BooleanVar(value=app.notify_var.get())
+        self.v_start = tk.BooleanVar(value=s["show_start"])
+        self.v_qonly = tk.BooleanVar(value=s["start_queue_only"])
+        self.v_later = tk.BooleanVar(value=s["show_final_later"])
+        self.v_batch = tk.BooleanVar(value=s["show_final_batch"])
+        self.v_imtime = tk.BooleanVar(value=s["ignore_mtime"])
+        self.v_dup = tk.StringVar(value=dict(DUP_ACTIONS)[s["dup_action"]])
+        self.v_ua = tk.StringVar(value=s["manual_ua"])
+
+        r = ttk.Frame(d)
+        r.pack(fill="x")
+        ttk.Label(r, text='Customizar diálogo "Progresso de download"').pack(side="left")
+        ttk.Button(r, text="Editar...", width=10, command=self.edit_progress).pack(side="right")
+
+        ttk.Checkbutton(d, text='Ver mensagem de início de download (janela "Informação do arquivo")',
+                        variable=self.v_start, command=self.dl_state).pack(anchor="w", pady=(10, 2))
+        self.cb_qonly = ttk.Checkbutton(d, text="Não começar a baixar, somente adicionar arquivos à fila",
+                                        variable=self.v_qonly)
+        self.cb_qonly.pack(anchor="w", padx=(22, 0))
+        ttk.Checkbutton(d, text="Ver mensagem de download completo", variable=self.v_notify).pack(anchor="w", pady=(8, 0))
+        ttk.Label(d, text="Nota: esta configuração não está relacionada com o processo de filas",
+                  foreground="#555555").pack(anchor="w", padx=(22, 0))
+        ttk.Checkbutton(d, text='Mostrar painel de final se pressionar "Baixar depois"',
+                        variable=self.v_later).pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(d, text="Mostrar painel de final se adicionar grupo de downloads",
+                        variable=self.v_batch).pack(anchor="w", pady=2)
+        ttk.Checkbutton(d, text="Ignorar mudanças de horário do arquivo quando continuar um download",
+                        variable=self.v_imtime).pack(anchor="w", pady=2)
+        ttk.Separator(d).pack(fill="x", pady=8)
+        ttk.Label(d, text="Se um link duplicado for adicionado:").pack(anchor="w")
+        ttk.Combobox(d, textvariable=self.v_dup, values=[t for _, t in DUP_ACTIONS], state="readonly",
+                     width=60).pack(anchor="w", pady=(2, 8))
+        ttk.Label(d, text="User-Agent para downloads adicionados manualmente:").pack(anchor="w")
+        ttk.Entry(d, textvariable=self.v_ua).pack(fill="x", pady=(2, 8))
+        r = ttk.Frame(d)
+        r.pack(fill="x")
+        ttk.Label(r, text="Configurar verificação contra vírus").pack(side="left")
+        ttk.Button(r, text="Editar...", width=10, command=self.edit_av).pack(side="right")
+        self.dl_state()
+
+    def dl_state(self):
+        # "somente adicionar à fila" só faz sentido quando a janela de informação não é mostrada
+        self.cb_qonly.configure(state="disabled" if self.v_start.get() else "normal")
+
+    def edit_progress(self):
+        ProgressCustomDialog(self.win, self.prog_ui, lambda ui: self.prog_ui.update(ui))
+
+    def edit_av(self):
+        AntivirusDialog(self.win, self.av, lambda av: self.av.update(av))
+
+    # ================= aba Velocidade =================
+    def build_speed(self, nb):
+        s = self.app.settings
         v = ttk.Frame(nb, padding=14)
         nb.add(v, text="Velocidade")
         self.v_lim_on = tk.BooleanVar(value=s["speed_limit_kbps"] > 0)
@@ -1782,94 +2526,10 @@ class OptionsDialog:
                   foreground="#555555", justify="left").pack(anchor="w", pady=(10, 0))
         self.lim_state()
 
-        # --- Salvar em (categorias) ---
-        c = ttk.Frame(nb, padding=14)
-        nb.add(c, text="Salvar em")
-        self.ct = ttk.Treeview(c, columns=("pasta", "exts"), show="tree headings", height=7, selectmode="browse")
-        for cid, t, w in (("#0", "Categoria", 110), ("pasta", "Pasta", 250), ("exts", "Extensões", 220)):
-            self.ct.heading(cid, text=t)
-            self.ct.column(cid, width=w, anchor="w")
-        self.ct.pack(fill="x")
-        self.ct.bind("<<TreeviewSelect>>", self.load_fields)
-        self.cur = None
-        self.v_folder, self.v_exts = tk.StringVar(), tk.StringVar()
-        r = ttk.Frame(c)
-        r.pack(fill="x", pady=(10, 2))
-        ttk.Label(r, text="Pasta:", width=11).pack(side="left")
-        ttk.Entry(r, textvariable=self.v_folder).pack(side="left", fill="x", expand=True, padx=4)
-        ttk.Button(r, text="...", width=3, command=self.browse).pack(side="left")
-        r = ttk.Frame(c)
-        r.pack(fill="x", pady=2)
-        ttk.Label(r, text="Extensões:", width=11).pack(side="left")
-        ttk.Entry(r, textvariable=self.v_exts).pack(side="left", fill="x", expand=True, padx=4)
-        r = ttk.Frame(c)
-        r.pack(pady=(10, 0))
-        ttk.Button(r, text="Atualizar categoria", command=self.commit_fields).pack(side="left", padx=4)
-        ttk.Button(r, text="Nova categoria...", command=self.new_cat).pack(side="left", padx=4)
-        ttk.Button(r, text="Excluir categoria", command=self.del_cat).pack(side="left", padx=4)
-        self.fill_cats()
-
-        bf = ttk.Frame(win)
-        bf.pack(pady=10)
-        ttk.Button(bf, text="OK", width=12, command=self.ok).pack(side="left", padx=6)
-        ttk.Button(bf, text="Cancelar", width=12, command=win.destroy).pack(side="left", padx=6)
-        ttk.Button(bf, text="Aplicar", width=12, command=self.apply).pack(side="left", padx=6)
-        win.bind("<Escape>", lambda e: win.destroy())
-        center_front(win)
-
     def lim_state(self):
         self.lim_spin.configure(state="normal" if self.v_lim_on.get() else "disabled")
 
-    # ---------- categorias ----------
-    def fill_cats(self, select=None):
-        self.ct.delete(*self.ct.get_children())
-        for name, info in self.cats.items():
-            self.ct.insert("", "end", iid=name, text=name, values=(info["folder"], " ".join(info["exts"])))
-        first = select if select in self.cats else next(iter(self.cats), None)
-        if first:
-            self.ct.selection_set(first)
-
-    def load_fields(self, _e=None):
-        s = self.ct.selection()
-        self.cur = s[0] if s else None
-        if self.cur in self.cats:
-            self.v_folder.set(self.cats[self.cur]["folder"])
-            self.v_exts.set(" ".join(self.cats[self.cur]["exts"]))
-
-    def commit_fields(self):
-        if self.cur not in self.cats:
-            return
-        folder = self.v_folder.get().strip()
-        if folder:
-            self.cats[self.cur]["folder"] = os.path.normpath(folder)
-        self.cats[self.cur]["exts"] = [e.lower().lstrip(".") for e in re.split(r"[,\s;]+", self.v_exts.get()) if e.strip(". ")]
-        self.fill_cats(self.cur)
-
-    def browse(self):
-        p = filedialog.askdirectory(parent=self.win, initialdir=self.v_folder.get() or DEFAULT_FOLDER)
-        if p:
-            self.v_folder.set(os.path.normpath(p))
-
-    def new_cat(self):
-        name = simpledialog.askstring("Nova categoria", "Nome da categoria:", parent=self.win)
-        name = (name or "").strip()
-        if not name:
-            return
-        if name in self.cats:
-            messagebox.showerror("Erro", "Já existe uma categoria com esse nome.", parent=self.win)
-            return
-        self.cats[name] = {"folder": os.path.join(DEFAULT_FOLDER, name), "exts": []}
-        self.fill_cats(name)
-
-    def del_cat(self):
-        if not self.cur or self.cur == "Geral" or len(self.cats) <= 1:
-            messagebox.showinfo("PyDM", 'A categoria "Geral" não pode ser excluída.', parent=self.win)
-            return
-        del self.cats[self.cur]
-        self.cur = None
-        self.fill_cats()
-
-    # ---------- aplicar ----------
+    # ================= aplicar =================
     def apply(self):
         app, s = self.app, self.app.settings
 
@@ -1883,13 +2543,61 @@ class OptionsDialog:
         app.conns_var.set(s["conns"])
         app.clip_var.set(self.v_clip.get())
         s["monitor_clipboard"] = bool(self.v_clip.get())
+        s["clip_auto"] = bool(self.v_clip_auto.get())
         app.notify_var.set(self.v_notify.get())
         s["show_complete"] = bool(self.v_notify.get())
         if app.tray:
             s["close_to_tray"] = bool(self.v_tray.get())
+
+        # integração com o navegador
+        s["browsers"] = copy.deepcopy(self.browsers)
+        s["keys"] = dict(self.keys)
+        s["menu"], s["menu_title"] = dict(self.menu), self.menu_title
+
+        # tipos de arquivos
+        s["capture_exts"] = self.words(self.txt_exts, upper=True)
+        s["exclude_sites"] = self.words(self.txt_sites)
+        s["exclude_addrs"] = list(self.excl_addrs)
+
+        # salvar em
         self.commit_fields()
-        s["categories"] = self.cats
+        s["categories"] = copy.deepcopy(self.cats)
+        s["set_mtime"] = bool(self.v_mtime.get())
+        tmp = self.v_temp.get().strip()
+        if tmp:
+            try:
+                os.makedirs(tmp, exist_ok=True)
+                tmp = os.path.normpath(tmp)
+            except OSError as ex:
+                messagebox.showwarning("Pasta temporária", f"Não foi possível usar a pasta:\n{tmp}\n\n{ex}\n\n"
+                                       "Os parciais continuarão na pasta de destino.", parent=self.win)
+                tmp = ""
+                self.v_temp.set("")
+        s["temp_folder"] = tmp
+
+        # downloads
+        s["show_start"] = bool(self.v_start.get())
+        s["start_queue_only"] = bool(self.v_qonly.get())
+        s["show_final_later"] = bool(self.v_later.get())
+        s["show_final_batch"] = bool(self.v_batch.get())
+        s["ignore_mtime"] = bool(self.v_imtime.get())
+        s["dup_action"] = next((k for k, t in DUP_ACTIONS if t == self.v_dup.get()), "ask")
+        s["manual_ua"] = self.v_ua.get().strip() or UA
+        s["progress_ui"] = dict(self.prog_ui)
+        s["antivirus"] = dict(self.av)
+
+        # início automático com o Windows (fica no registro, não no settings.json)
+        want = bool(self.v_auto.get())
+        if want != self.v_auto0:
+            if autostart_set(want):
+                self.v_auto0 = want
+            else:
+                self.v_auto.set(self.v_auto0)
+                messagebox.showerror("PyDM", "Não foi possível alterar o início automático com o Windows.\n"
+                                             "Detalhes em ~/.pydm/pydm.log.", parent=self.win)
+
         save_cfg(s)
+        app.apply_runtime()
         app.set_global_limit(num(self.v_lim, 1, 1000000, 1024) if self.v_lim_on.get() else 0)
         app.rebuild_categories()
 
@@ -2010,6 +2718,8 @@ class App:
         self.show_cats_var = tk.BooleanVar(value=self.settings["show_cats"])
         self.limit_var = tk.IntVar(value=self.settings["speed_limit_kbps"])
         GLOBAL["kbps"] = self.settings["speed_limit_kbps"]
+        SETTINGS_REF["s"] = self.settings   # a Bridge lê as configurações por aqui
+        self.apply_runtime()
         ttk.Style().configure("Treeview", rowheight=20)
         self.mi = {}   # itens de menu que mudam de estado (habilitado/desabilitado)
         self.tb = {}   # botões da barra de ferramentas
@@ -2530,7 +3240,8 @@ class App:
                 messagebox.showerror("Erro", "Informe uma URL válida (http/https).", parent=win)
                 return
             win.destroy()
-            self.open_info(u)
+            if self.check_duplicate(u):
+                self.open_info(u)
 
         ttk.Button(f, text="OK", command=ok).grid(row=2, column=0, sticky="e", pady=(8, 0), padx=4)
         ttk.Button(f, text="Cancelar", command=win.destroy).grid(row=2, column=1, sticky="w",
@@ -2539,6 +3250,89 @@ class App:
         win.bind("<Escape>", lambda _e: win.destroy())
         e.focus()
         e.select_range(0, "end")
+
+    def apply_runtime(self):
+        """Passa para o motor de download as opções que ele consulta durante o download."""
+        s = self.settings
+        GLOBAL["ua"] = s["manual_ua"]
+        GLOBAL["temp"] = s["temp_folder"]
+        GLOBAL["set_mtime"] = s["set_mtime"]
+        GLOBAL["ignore_mtime"] = s["ignore_mtime"]
+
+    def restart_bridge(self):
+        """Reinicia o servidor local que recebe os links da extensão. Retorna True se subiu."""
+        try:
+            if self.bridge:
+                self.bridge.shutdown()
+                self.bridge.server_close()
+        except Exception:
+            pass
+        self.bridge = start_bridge()
+        return bool(self.bridge)
+
+    def check_duplicate(self, url):
+        """Aplica a opção 'Se um link duplicado for adicionado'. True = pode adicionar."""
+        dup = next((d for d in self.items if d.url == url), None)
+        if not dup:
+            return True
+        act = self.settings["dup_action"]
+        if act == "ignore":
+            return False
+        if act == "rename":
+            return True
+        return messagebox.askyesno("Link duplicado",
+                                   f"Este endereço já está na lista:\n\n{dup.name or guess_name(url)}\n\n"
+                                   "Adicionar mesmo assim?", parent=self.root)
+
+    def add_silent(self, url, headers, start):
+        """Adiciona sem mostrar a janela 'Informação do arquivo' (pasta pela categoria, nome pelo servidor)."""
+        cats = self.settings["categories"]
+        cat = category_for(guess_name(url), cats)
+        return self.add(url, cats[cat]["folder"], self.settings["conns"], headers, category=cat,
+                        status="Na fila" if start else "Pausado", queued=not start)
+
+    def on_new_link(self, url, headers):
+        """Link vindo do navegador: mostra a janela de informação ou adiciona direto, conforme as Opções."""
+        if not self.check_duplicate(url):
+            return
+        if self.settings["show_start"]:
+            self.open_info(url, headers)
+        else:
+            self.add_silent(url, headers, start=not self.settings["start_queue_only"])
+
+    def scan_file(self, d):
+        """Verificação contra vírus (programa externo) depois que o download termina."""
+        av = self.settings["antivirus"]
+        if not av["enabled"] or not d.path or not os.path.exists(d.path):
+            return
+        prog = av["program"].strip() or default_av_program()
+        if not prog:
+            log("Antivírus: nenhum programa configurado/encontrado.")
+            return
+        threading.Thread(target=self._scan_worker, args=(prog, av["args"], d.path, d.name or d.path),
+                         daemon=True).start()
+
+    @staticmethod
+    def _scan_worker(prog, args, path, name):
+        try:
+            line = f'"{prog}" ' + args.replace("{file}", path)
+            cmd = line if sys.platform.startswith("win") else shlex.split(line)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
+                               stdin=subprocess.DEVNULL, creationflags=NOWIN)
+            TRAY_EVENTS.put(("av", name, r.returncode, (r.stdout or "") + (r.stderr or "")))
+        except Exception as ex:
+            TRAY_EVENTS.put(("av", name, None, str(ex)))
+
+    def show_av_result(self, name, code, out):
+        log(f"Antivírus: {name} -> código {code}\n{(out or '')[-800:]}")
+        if code is None:
+            messagebox.showerror("Verificação contra vírus",
+                                 f"Não foi possível verificar \"{name}\":\n{(out or '')[:300]}", parent=self.root)
+        elif code != 0:
+            messagebox.showwarning("Verificação contra vírus",
+                                   f"O verificador retornou o código {code} para:\n{name}\n\n"
+                                   "O arquivo pode ser perigoso. Veja os detalhes em ~/.pydm/pydm.log.",
+                                   parent=self.root)
 
     # ---------- iniciar / parar ----------
     def resume_sel(self):
@@ -2714,7 +3508,8 @@ class App:
             messagebox.showinfo("PyDM", "Não há nenhum endereço (http/https) na área de transferência.",
                                 parent=self.root)
         elif len(urls) == 1:
-            self.open_info(urls[0])
+            if self.check_duplicate(urls[0]):
+                self.open_info(urls[0])
         else:
             self.batch_dialog(urls)
         return "break"
@@ -2792,9 +3587,14 @@ class App:
         try:
             os.makedirs(os.path.dirname(new), exist_ok=True)
             if d.path:
-                src = d.path if d.status == "Concluído" else d.part
-                if os.path.exists(src):
-                    shutil.move(src, new if d.status == "Concluído" else new + ".part")
+                if d.status == "Concluído":
+                    src, dst = d.path, new
+                elif d.part_path:          # parcial na pasta temporária: só muda o destino final
+                    src = dst = None
+                else:
+                    src, dst = d.part, new + ".part"
+                if src and os.path.exists(src):
+                    shutil.move(src, dst)
         except OSError as ex:
             messagebox.showerror("Erro", f"Não foi possível mover o arquivo:\n{ex}", parent=self.root)
             return
@@ -2842,6 +3642,10 @@ class App:
         self.progress[id(d)] = ProgressDialog(self, d)
 
     def finished(self, d):
+        try:
+            self.scan_file(d)
+        except Exception as ex:
+            log(f"Antivírus: {ex!r}")
         dlg = self.progress.get(id(d))
         if dlg:
             dlg.close()
@@ -2936,7 +3740,7 @@ class App:
                 self.show_window()
                 continue
             try:
-                self.open_info(j["url"], j["headers"])
+                self.on_new_link(j["url"], j["headers"])
             except Exception:
                 # se a janela falhar por qualquer motivo, não perde o download: adiciona com os padrões
                 self.add(j["url"], DEFAULT_FOLDER, self.settings["conns"], j["headers"])
@@ -3004,8 +3808,12 @@ class App:
             if c != self.last_clip:
                 self.last_clip = c
                 if re.match(r"^https?://\S+\.\w{2,5}(\?\S*)?$", c) and " " not in c:
-                    if messagebox.askyesno("PyDM", f"Baixar este link?\n\n{c[:100]}"):
-                        self.open_info(c)
+                    if self.settings["clip_auto"]:   # início automático, sem perguntar
+                        if self.check_duplicate(c):
+                            self.add_silent(c, {}, True)
+                    elif messagebox.askyesno("PyDM", f"Baixar este link?\n\n{c[:100]}"):
+                        if self.check_duplicate(c):
+                            self.open_info(c)
         self.root.after(1000, self.watch_clipboard)
 
     # ---------- bandeja do sistema ----------
@@ -3042,6 +3850,8 @@ class App:
             try:
                 if isinstance(ev, tuple) and ev[0] == "pip":
                     self.finish_install(ev[1], ev[2])
+                elif isinstance(ev, tuple) and ev[0] == "av":
+                    self.show_av_result(ev[1], ev[2], ev[3])
                 elif ev == "show":
                     self.show_window()
                 elif ev == "quit":
@@ -3198,6 +4008,11 @@ if __name__ == "__main__":
     if already_running():   # já existe um PyDM (provavelmente na bandeja): ele mostra a janela
         sys.exit(0)
     root = tk.Tk()
-    App(root)
+    app = App(root)
+    if "--tray" in sys.argv:   # iniciado com o Windows: fica escondido na bandeja
+        if app.tray:
+            root.withdraw()
+        else:
+            root.iconify()
     root.mainloop()
     os._exit(0)   # a lista já foi salva em quit_app; garante que nenhuma thread da bandeja segure o processo
