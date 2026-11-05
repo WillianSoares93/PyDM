@@ -830,6 +830,22 @@ def capture_decision(s, url, filename="", ua="", mods="", manual=False):
     return True, ""
 
 
+WEB_EXTS = {"HTML", "HTM", "XHTML", "SHTML", "PHP", "ASP", "ASPX", "JSP", "CGI"}
+
+
+def looks_like_download(text, s):
+    """True se o texto copiado parece um link de arquivo: URL http(s) única cuja extensão está na lista
+    de tipos de arquivos das Opções (ou é uma extensão que não seja de página web)."""
+    if not text or re.search(r"\s", text) or not re.match(r"^https?://\S+$", text):
+        return False
+    ext = os.path.splitext(urllib.parse.unquote(urllib.parse.urlparse(text).path))[1].lstrip(".").upper()
+    if not ext:
+        return False
+    if any(fnmatch.fnmatchcase(ext, pat.upper()) for pat in s["capture_exts"]):
+        return True
+    return ext not in WEB_EXTS and 2 <= len(ext) <= 5
+
+
 class Bridge(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -2541,6 +2557,8 @@ class OptionsDialog:
         s["conns"] = num(self.v_conns, 1, 32, s["conns"])
         s["max_active"] = num(self.v_max, 1, 10, s["max_active"])
         app.conns_var.set(s["conns"])
+        if self.v_clip.get() and not app.clip_var.get():
+            app.reset_clip_baseline()
         app.clip_var.set(self.v_clip.get())
         s["monitor_clipboard"] = bool(self.v_clip.get())
         s["clip_auto"] = bool(self.v_clip_auto.get())
@@ -2589,8 +2607,14 @@ class OptionsDialog:
         # início automático com o Windows (fica no registro, não no settings.json)
         want = bool(self.v_auto.get())
         if want != self.v_auto0:
-            if autostart_set(want):
+            if autostart_set(want) and autostart_get() == want:   # confere lendo de volta do registro
                 self.v_auto0 = want
+                log("Início automático " + (f"ativado: {autostart_cmd()}" if want else "desativado"))
+                if want:
+                    messagebox.showinfo("PyDM", "Início automático ativado.\n\nComando registrado no Windows:\n"
+                                                f"{autostart_cmd()}\n\nNa próxima vez que você entrar no Windows o "
+                                                "PyDM abre na bandeja (perto do relógio; talvez dentro da seta ^).",
+                                        parent=self.win)
             else:
                 self.v_auto.set(self.v_auto0)
                 messagebox.showerror("PyDM", "Não foi possível alterar o início automático com o Windows.\n"
@@ -2729,11 +2753,8 @@ class App:
         self.status_bar = ttk.Label(root, text="", anchor="w", padding=4)
         self.status_bar.pack(side="bottom", fill="x")
         self.build_body()
-        self.last_clip = ""
-        try:   # não perguntar logo na abertura sobre um link que já estava copiado
-            self.last_clip = root.clipboard_get().strip()
-        except tk.TclError:
-            pass
+        self.last_clip, self.last_seq = "", None
+        self.reset_clip_baseline()   # não perguntar logo na abertura sobre um link que já estava copiado
         self.bridge = start_bridge()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Control-n>", lambda e: self.add_dialog())
@@ -3799,22 +3820,52 @@ class App:
             self.save()
         self.root.after(500, self.tick)
 
-    def watch_clipboard(self):
-        if self.clip_var.get():
+    @staticmethod
+    def clip_seq():
+        """Número de sequência da área de transferência (Windows): muda a cada cópia, mesmo do mesmo texto."""
+        if sys.platform.startswith("win"):
             try:
-                c = self.root.clipboard_get().strip()
-            except tk.TclError:
-                c = ""
-            if c != self.last_clip:
-                self.last_clip = c
-                if re.match(r"^https?://\S+\.\w{2,5}(\?\S*)?$", c) and " " not in c:
-                    if self.settings["clip_auto"]:   # início automático, sem perguntar
-                        if self.check_duplicate(c):
-                            self.add_silent(c, {}, True)
-                    elif messagebox.askyesno("PyDM", f"Baixar este link?\n\n{c[:100]}"):
-                        if self.check_duplicate(c):
-                            self.open_info(c)
-        self.root.after(1000, self.watch_clipboard)
+                import ctypes
+                return ctypes.windll.user32.GetClipboardSequenceNumber()
+            except Exception:
+                pass
+        return None
+
+    def reset_clip_baseline(self):
+        """Considera o que já está copiado como 'visto' (para não perguntar sobre um link antigo)."""
+        self.last_seq = self.clip_seq()
+        try:
+            self.last_clip = self.root.clipboard_get().strip()
+        except tk.TclError:
+            self.last_clip = ""
+
+    def check_clipboard(self):
+        seq = self.clip_seq()
+        try:
+            c = self.root.clipboard_get().strip()
+        except tk.TclError:
+            c = ""
+        changed = (seq != self.last_seq) if seq is not None else (c != self.last_clip)
+        self.last_seq, self.last_clip = seq, c
+        if not changed or not looks_like_download(c, self.settings):
+            return
+        log(f"Área de transferência: link detectado {c[:120]}")
+        if self.settings["clip_auto"]:   # início automático, sem perguntar
+            if self.check_duplicate(c):
+                self.add_silent(c, {}, True)
+        elif messagebox.askyesno("PyDM", f"Baixar este link?\n\n{c[:100]}"):
+            if self.check_duplicate(c):
+                self.open_info(c)
+
+    def watch_clipboard(self):
+        try:
+            if self.clip_var.get():
+                self.check_clipboard()
+        except Exception as ex:   # um erro aqui não pode matar o monitor
+            import traceback
+            log(f"Área de transferência: {ex!r}\n{traceback.format_exc()}")
+        finally:
+            self.root.after(1000, self.watch_clipboard)
 
     # ---------- bandeja do sistema ----------
     def start_tray(self):
@@ -4008,10 +4059,23 @@ if __name__ == "__main__":
     if already_running():   # já existe um PyDM (provavelmente na bandeja): ele mostra a janela
         sys.exit(0)
     root = tk.Tk()
+
+    def _tk_error(exc, val, tb):   # sem console (pythonw) os erros de botões/menus ficariam invisíveis
+        import traceback
+        log("Erro na interface:\n" + "".join(traceback.format_exception(exc, val, tb)))
+    root.report_callback_exception = _tk_error
+    log(f"PyDM iniciado (argumentos: {sys.argv[1:]}, executável: {sys.executable})")
     app = App(root)
     if "--tray" in sys.argv:   # iniciado com o Windows: fica escondido na bandeja
         if app.tray:
             root.withdraw()
+
+            def _hello():
+                try:
+                    app.tray.notify("O PyDM foi iniciado e está na bandeja.", "PyDM")
+                except Exception as ex:
+                    log(f"Aviso da bandeja: {ex!r}")
+            root.after(3000, _hello)
         else:
             root.iconify()
     root.mainloop()
