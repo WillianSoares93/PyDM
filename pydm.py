@@ -2924,14 +2924,22 @@ class App:
         self.tree.bind("<Button-3>", self.context_menu)
         self.tree.bind("<<TreeviewSelect>>", self.update_toolbar)
 
+        self._sash_pending = bool(self.settings["show_cats"])
         if self.settings["show_cats"]:
             self.pw.add(self.left, weight=0)
-            self.root.after(120, self._place_sash)
         self.pw.add(self.right, weight=1)
+        # a divisória só pode ser posicionada com a janela já visível e com tamanho real; se o PyDM abre
+        # escondido na bandeja (--tray) isso só acontece quando a janela é mostrada pela primeira vez
+        self.pw.bind("<Configure>", self._place_sash)
 
-    def _place_sash(self):
+    def _place_sash(self, _e=None):
+        if not self._sash_pending:
+            return
         try:
+            if self.pw.winfo_width() < 400 or str(self.left) not in self.pw.panes():
+                return
             self.pw.sashpos(0, 200)
+            self._sash_pending = False
         except tk.TclError:
             pass
 
@@ -2941,6 +2949,7 @@ class App:
         present = str(self.left) in self.pw.panes()
         if show and not present:
             self.pw.insert(0, self.left)
+            self._sash_pending = True
             self.root.after(60, self._place_sash)
         elif not show and present:
             self.pw.forget(self.left)
