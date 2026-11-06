@@ -164,8 +164,9 @@ def _untop(win):
         pass
 
 
-def center_front(win, offset=0):
-    """Centraliza a janela e a traz para a frente (o foco costuma estar no navegador)."""
+def center_front(win, offset=0, keep_top=False):
+    """Centraliza a janela e a traz para a frente (o foco costuma estar no navegador).
+    keep_top=True mantém a janela na frente até ser fechada (para diálogos modais)."""
     try:
         win.update_idletasks()
         x = (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2 + offset
@@ -174,7 +175,8 @@ def center_front(win, offset=0):
         win.deiconify()
         win.lift()
         win.attributes("-topmost", True)
-        win.after(400, lambda: _untop(win))
+        if not keep_top:
+            win.after(400, lambda: _untop(win))
         win.focus_force()
     except tk.TclError:
         pass
@@ -2270,20 +2272,13 @@ class ToolButton(tk.Canvas):
 
 
 # ---------- janelas auxiliares ----------
-def make_modal(win, parent):
-    win.transient(parent)
-    try:
-        win.wait_visibility()
-        win.grab_set()
-    except tk.TclError:
-        pass
-
-
 def ask_delete(app, msg, title="Excluir"):
     """Confirmação com a opção de apagar também os arquivos do disco. Retorna (confirmou, apagar_arquivos)."""
     win = tk.Toplevel(app.root)
     win.title(title)
     win.resizable(False, False)
+    win.transient(app.root)   # antes de mostrar a janela (como nos outros diálogos); depois dela, o Windows pode
+                              # jogar o diálogo para trás da janela principal, que fica travada pelo grab_set
     res, var = {"ok": False}, tk.BooleanVar(value=False)
     f = ttk.Frame(win, padding=14)
     f.pack()
@@ -2300,8 +2295,13 @@ def ask_delete(app, msg, title="Excluir"):
     ttk.Button(bf, text="Não", width=12, command=lambda: done(False)).pack(side="left", padx=6)
     win.protocol("WM_DELETE_WINDOW", lambda: done(False))
     win.bind("<Escape>", lambda e: done(False))
-    center_front(win)
-    make_modal(win, app.root)
+    center_front(win, keep_top=True)
+    try:
+        win.wait_visibility()
+        win.grab_set()
+        win.focus_force()
+    except tk.TclError:
+        pass
     app.root.wait_window(win)
     return res["ok"], var.get()
 
