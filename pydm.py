@@ -24,7 +24,7 @@ Opcional: "pip install pystray pillow" habilita o ícone da bandeja. Sem eles, f
 encerra o programa, como antes.
 """
 
-import os, re, json, time, threading, subprocess, sys, queue, copy, math, shutil, fnmatch, hashlib, glob, shlex
+import os, re, json, time, threading, subprocess, sys, queue, copy, math, shutil, fnmatch, hashlib, glob, shlex, uuid
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -86,6 +86,27 @@ DEFAULT_AV = {"enabled": False, "program": "", "args": '-Scan -ScanType 3 -File 
 DUP_ACTIONS = (("ask", "Mostrar uma caixa de diálogo e perguntar o que fazer"),
                ("rename", "Adicionar mesmo assim (com outro nome se o arquivo já existir)"),
                ("ignore", "Ignorar o link duplicado"))
+BIN_DIR = os.path.join(APP_DIR, "bin")        # yt-dlp, ffmpeg e deno instalados pelo PyDM
+MEDIA_DIR = os.path.join(APP_DIR, "media")    # arquivos temporários de cada download de vídeo
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com")
+COMPONENT_URLS = {
+    "yt-dlp": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
+    "deno": "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip",
+    "ffmpeg": "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+}
+# formatos de áudio do painel: codec/qualidade do yt-dlp (-x --audio-format/--audio-quality) e kbps p/ estimar o tamanho
+AUDIO_PRESETS = {
+    "mp3-320": {"label": "MP3 · 320 kbps", "codec": "mp3", "q": "320K", "ext": "mp3", "kbps": 320},
+    "mp3-192": {"label": "MP3 · 192 kbps", "codec": "mp3", "q": "192K", "ext": "mp3", "kbps": 192},
+    "mp3-128": {"label": "MP3 · 128 kbps", "codec": "mp3", "q": "128K", "ext": "mp3", "kbps": 128},
+    "m4a": {"label": "M4A · AAC", "codec": "m4a", "q": None, "ext": "m4a", "kbps": 0},
+    "wav": {"label": "WAV · sem compressão", "codec": "wav", "q": None, "ext": "wav", "kbps": 1411},
+    "flac": {"label": "FLAC · sem perdas", "codec": "flac", "q": None, "ext": "flac", "kbps": 0},
+    "ogg": {"label": "OGG · Vorbis", "codec": "vorbis", "q": "5", "ext": "ogg", "kbps": 160},
+    "opus": {"label": "OPUS", "codec": "opus", "q": None, "ext": "opus", "kbps": 0},
+}
+DEFAULT_VIDEO = {"enabled": True, "audio_formats": ["mp3-320", "mp3-192", "mp3-128", "m4a", "wav", "flac"],
+                 "embed_meta": True, "ytdlp": "", "ffmpeg": "", "video_cat": "Vídeo", "audio_cat": "Música"}
 SETTINGS_REF = {"s": None}   # a Bridge (outra thread) lê as configurações por aqui
 
 
@@ -214,7 +235,7 @@ def load_cfg():
          "exclude_addrs": [], "set_mtime": False, "ignore_mtime": False, "temp_folder": "",
          "show_start": True, "start_queue_only": False, "show_final_later": True, "show_final_batch": True,
          "dup_action": "ask", "manual_ua": UA, "progress_ui": dict(DEFAULT_PROGRESS_UI),
-         "antivirus": dict(DEFAULT_AV)}
+         "antivirus": dict(DEFAULT_AV), "video": copy.deepcopy(DEFAULT_VIDEO)}
     try:
         with open(CFG, encoding="utf-8") as f:
             j = json.load(f)
@@ -291,6 +312,16 @@ def load_cfg():
                    and isinstance(b.get("ua"), str) and b["ua"].strip()]
             if out:
                 s["browsers"] = out
+        vd = j.get("video")
+        if isinstance(vd, dict):
+            for k in ("enabled", "embed_meta"):
+                if k in vd:
+                    s["video"][k] = bool(vd[k])
+            for k in ("ytdlp", "ffmpeg", "video_cat", "audio_cat"):
+                if isinstance(vd.get(k), str):
+                    s["video"][k] = vd[k].strip()
+            if isinstance(vd.get("audio_formats"), list):
+                s["video"]["audio_formats"] = [x for x in vd["audio_formats"] if x in AUDIO_PRESETS]
     except Exception:
         pass
     return s
@@ -474,6 +505,7 @@ class Download:
         # ações ao concluir (valem só nesta sessão, de propósito: ninguém quer o PC desligando dias depois)
         self.on_done = {"modem": False, "quit": False, "shutdown": False, "mode": "Desligar", "force": False}
         self.speed, self._last = 0.0, (time.time(), 0)
+        self.note = ""                  # texto extra do estado (ex.: "Convertendo o áudio...")
 
     # ---------- persistência ----------
     def to_dict(self):
@@ -783,6 +815,357 @@ INBOX = queue.Queue()
 TRAY_EVENTS = queue.Queue()  # eventos do menu da bandeja (vêm de outra thread)
 
 
+# ====================================================================================
+#  Vídeo e áudio de páginas (botão "Baixar este vídeo" da extensão)
+#  O PyDM não extrai vídeos sozinho: ele usa o yt-dlp (extrai/baixa) com o ffmpeg (junta e converte)
+#  e o Deno (necessário para o YouTube). Os três ficam em ~/.pydm/bin ou no PATH.
+# ====================================================================================
+class MediaError(Exception):
+    pass
+
+
+def find_tool(name, custom=""):
+    """Localiza yt-dlp / ffmpeg / deno: caminho das Opções, depois ~/.pydm/bin, depois o PATH."""
+    if custom and os.path.isfile(custom):
+        return custom
+    exe = name + (".exe" if sys.platform.startswith("win") else "")
+    local = os.path.join(BIN_DIR, exe)
+    if os.path.isfile(local):
+        return local
+    return shutil.which(name)
+
+
+def media_tools(s):
+    v = s["video"]
+    return {"ytdlp": find_tool("yt-dlp", v["ytdlp"]), "ffmpeg": find_tool("ffmpeg", v["ffmpeg"]),
+            "deno": find_tool("deno")}
+
+
+def media_tools_named(s):
+    t = media_tools(s)
+    return {"yt-dlp": t["ytdlp"], "deno": t["deno"], "ffmpeg": t["ffmpeg"]}
+
+
+def valid_media_id(mid):
+    """O navegador só escolhe entre opções que o PyDM mesmo ofereceu: nunca passa argumentos soltos ao yt-dlp."""
+    return bool(re.fullmatch(r"v\d{3,4}", mid)) or mid in AUDIO_PRESETS or mid == "orig"
+
+
+def _is_youtube(url):
+    h = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(h == d or h.endswith("." + d) for d in YOUTUBE_HOSTS)
+
+
+def _last_error(text):
+    errs = [l[6:].strip() for l in (text or "").splitlines() if l.startswith("ERROR:")]
+    msg = re.sub(r"\x1b\[[0-9;]*m", "", errs[-1] if errs else "").strip()
+    msg = re.sub(r"^\[[^\]]+\]\s*[\w\-]+:\s*", "", msg)   # tira o prefixo "[youtube] abc123: "
+    return msg[:220]
+
+
+def ytdlp_base(s, url, headers=None):
+    """Começo da linha de comando do yt-dlp (comum à análise e ao download)."""
+    t = media_tools(s)
+    if not t["ytdlp"]:
+        raise MediaError("no_engine")
+    cmd = [t["ytdlp"], "--ignore-config", "--no-playlist", "--no-warnings", "--no-colors", "--encoding", "utf-8",
+           "--socket-timeout", "20", "--retries", "10", "--fragment-retries", "10"]
+    if t["deno"]:
+        cmd += ["--js-runtimes", "deno:" + t["deno"]]
+    if t["ffmpeg"]:
+        cmd += ["--ffmpeg-location", t["ffmpeg"]]
+    if not _is_youtube(url) and headers:   # no YouTube o yt-dlp usa as próprias identidades
+        for key in ("Referer", "Cookie"):
+            if headers.get(key):
+                cmd += ["--add-header", f"{key}:{headers[key]}"]
+        if headers.get("User-Agent"):
+            cmd += ["--user-agent", headers["User-Agent"]]
+    return cmd
+
+
+_FMT_CACHE = {}
+
+
+def media_probe(url, headers, s):
+    """Pergunta ao yt-dlp quais formatos o vídeo tem (JSON). Guarda o resultado por 5 minutos."""
+    key = (url, bool((headers or {}).get("Cookie")))
+    hit = _FMT_CACHE.get(key)
+    if hit and time.time() - hit[0] < 300:
+        return hit[1]
+    cmd = ytdlp_base(s, url, headers) + ["-J", url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=90, stdin=subprocess.DEVNULL, creationflags=NOWIN)
+    except subprocess.TimeoutExpired:
+        raise MediaError("Tempo esgotado ao analisar o vídeo.")
+    if r.returncode != 0 or not r.stdout.strip():
+        raise MediaError(_last_error(r.stderr) or "Não foi possível analisar este vídeo.")
+    try:
+        info = json.loads(r.stdout)
+    except ValueError:
+        raise MediaError("Resposta inesperada do yt-dlp.")
+    if len(_FMT_CACHE) > 20:
+        _FMT_CACHE.clear()
+    _FMT_CACHE[key] = (time.time(), info)
+    return info
+
+
+def _fsize(f, dur):
+    n = f.get("filesize") or f.get("filesize_approx")
+    if not n and f.get("tbr") and dur:
+        n = f["tbr"] * 125 * dur   # tbr é em kbit/s
+    return int(n) if n else None
+
+
+def _res_tag(h):
+    return " 8K" if h >= 4320 else " 4K" if h >= 2160 else " HD" if h >= 720 else ""
+
+
+def media_options(info, s, tools):
+    """Transforma o JSON do yt-dlp na lista que o painel mostra: qualidades de vídeo e formatos de áudio."""
+    dur = info.get("duration") or 0
+    fmts = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
+    if not fmts and info.get("url"):   # link direto: o yt-dlp descreve o arquivo no próprio nível
+        fmts = [info]
+    ffmpeg = bool(tools["ffmpeg"])
+    videos = [f for f in fmts if f.get("vcodec") != "none" and f.get("height")]
+    audios = [f for f in fmts if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    progressive = [f for f in videos if f.get("acodec") != "none"]   # já traz o som junto
+    pool = videos if ffmpeg else progressive
+    best_audio = max(audios, key=lambda f: f.get("abr") or f.get("tbr") or 0) if audios else None
+    asize = _fsize(best_audio, dur) if best_audio else None
+
+    vid_opts = []
+    for h in sorted({f["height"] for f in pool}, reverse=True):
+        f = max((x for x in pool if x["height"] == h), key=lambda x: x.get("tbr") or 0)
+        est = _fsize(f, dur)
+        if est and f.get("acodec") == "none" and asize:
+            est += asize
+        if ffmpeg:
+            cont = "MKV" if h > 1080 else "MP4"
+        else:
+            cont = (f.get("ext") or "mp4").upper()
+        vid_opts.append({"id": f"v{h}", "label": f"{cont} · {h}p{_res_tag(h)}", "size": est})
+
+    aud_opts = []
+    if ffmpeg:
+        for i in s["video"]["audio_formats"]:
+            if i not in AUDIO_PRESETS:
+                continue
+            p = AUDIO_PRESETS[i]
+            size = int(p["kbps"] * 125 * dur) if p["kbps"] and dur else (asize if p["codec"] == "m4a" else None)
+            aud_opts.append({"id": i, "label": p["label"], "size": size})
+    elif best_audio:   # sem ffmpeg não dá para converter: só o áudio como o site entrega
+        # o download usa "ba[ext=m4a]/ba": prefere M4A se existir, então o rótulo e o tamanho seguem o mesmo critério
+        m4a = [f for f in audios if f.get("ext") == "m4a"]
+        pick = max(m4a, key=lambda f: f.get("abr") or f.get("tbr") or 0) if m4a else best_audio
+        aud_opts.append({"id": "orig", "label": f"Áudio original ({(pick.get('ext') or 'm4a').upper()})",
+                         "size": _fsize(pick, dur)})
+    if not vid_opts and not aud_opts:
+        raise MediaError("Nenhum formato de vídeo ou áudio encontrado nesta página.")
+    return {"title": info.get("title") or "", "duration": dur, "live": bool(info.get("is_live")),
+            "video": vid_opts, "audio": aud_opts, "ffmpeg": ffmpeg, "deno": bool(tools["deno"])}
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def kill_tree(proc):
+    """Encerra o yt-dlp e os programas que ele abriu (ffmpeg)."""
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True,
+                           creationflags=NOWIN, timeout=10)
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+POSTPROC_NOTES = {"Merger": "Juntando vídeo e áudio...", "ExtractAudio": "Convertendo o áudio...",
+                  "VideoConvertor": "Convertendo o vídeo...", "EmbedThumbnail": "Gravando a capa...",
+                  "Metadata": "Gravando informações...", "MoveFiles": "Finalizando..."}
+
+
+class MediaDownload(Download):
+    """Download de vídeo/áudio de uma página: quem extrai, baixa, junta e converte é o yt-dlp.
+    Aparece na lista como qualquer download (pausar, retomar, fila, categorias...)."""
+
+    def __init__(self, url, folder, conns=8, headers=None, media=None):
+        super().__init__(url, folder, conns, headers)
+        self.media = dict(media or {})
+        self.media.setdefault("job", uuid.uuid4().hex[:12])
+        self.resumable, self.probed = True, True
+        self._base = self._cur = 0     # bytes dos fluxos já concluídos / do fluxo atual (vídeo e áudio vêm separados)
+        self.note = ""
+        self.proc = None
+
+    @property
+    def jobdir(self):
+        return os.path.join(MEDIA_DIR, self.media["job"])
+
+    @property
+    def downloaded(self):
+        if self.status == "Concluído":
+            return self.size or 0
+        n = int(self._base + self._cur)
+        return min(n, self.size) if self.size else n
+
+    def to_dict(self):
+        j = super().to_dict()
+        j["media"] = self.media
+        return j
+
+    @classmethod
+    def from_dict(cls, d):
+        o = super().from_dict(d)
+        o.media = dict(d.get("media") or o.media)
+        o.media.setdefault("job", uuid.uuid4().hex[:12])
+        return o
+
+    # ---------- linha de comando ----------
+    def command(self, s):
+        m, v = self.media, s["video"]
+        cmd = ytdlp_base(s, self.url, self.headers)
+        os.makedirs(self.jobdir, exist_ok=True)
+        cmd += ["--quiet", "--progress", "--newline", "--no-simulate", "--windows-filenames",
+                "--trim-filenames", "150", "-N", "4",
+                "-P", "home:" + self.folder, "-P", "temp:" + self.jobdir,
+                "--progress-template",
+                "download:PYDM|%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
+                "%(progress.total_bytes_estimate)s",
+                "--progress-template", "postprocess:PYDMPP|%(progress.postprocessor)s|%(progress.status)s",
+                "--print", "after_move:PYDMFILE|%(filepath)s"]
+        mid, ffm, suffix = m["id"], bool(find_tool("ffmpeg", v["ffmpeg"])), ""
+        if mid.startswith("v"):
+            h = int(mid[1:])
+            suffix = f" [{h}p]"
+            if ffm:
+                sel = (f"bv*[height<={h}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]"
+                       if h <= 1080 else f"bv*[height<={h}]+ba/b[height<={h}]")
+                cmd += ["-f", sel, "--merge-output-format", "mp4" if h <= 1080 else "mkv"]
+            else:
+                cmd += ["-f", f"b[height<={h}]/b"]
+        elif mid == "orig":
+            cmd += ["-f", "ba[ext=m4a]/ba"]
+        else:
+            p = AUDIO_PRESETS[mid]
+            cmd += ["-f", "ba/b", "-x", "--audio-format", p["codec"]]
+            if p["q"]:
+                cmd += ["--audio-quality", p["q"]]
+            if v["embed_meta"]:
+                cmd += ["--embed-metadata"]
+                if p["codec"] in ("mp3", "m4a", "flac", "opus", "vorbis"):
+                    cmd += ["--embed-thumbnail", "--convert-thumbnails", "jpg"]
+        if m.get("overwrite"):
+            cmd += ["--force-overwrites"]
+        cmd += ["-o", f"%(title)s{suffix}.%(ext)s"]
+        lims = [k for k in (self.limit_kbps, GLOBAL["kbps"]) if k > 0]
+        if lims:
+            cmd += ["--limit-rate", f"{min(lims)}K"]
+        return cmd + [self.url]
+
+    # ---------- execução ----------
+    def _killer(self, proc):
+        while proc.poll() is None:
+            if self.stop.wait(0.3):
+                kill_tree(proc)
+                return
+
+    def _on_line(self, line):
+        parts = line.split("|")
+        if parts[0] == "PYDM" and len(parts) >= 5:
+            dl = _num(parts[2])
+            if dl is None:
+                return
+            if parts[1] == "finished":     # terminou um fluxo (vídeo ou áudio): o próximo começa do zero
+                self._base += dl
+                self._cur = 0
+            else:
+                self._cur = dl
+        elif parts[0] == "PYDMPP" and len(parts) >= 3:
+            self.note = POSTPROC_NOTES.get(parts[1], "Processando...") if parts[2] == "started" else ""
+
+    def _run(self):
+        s = SETTINGS_REF["s"]
+        started = time.time()
+        try:
+            self.stop.clear()
+            self.failed, self.error, self.status = False, "", "Baixando"
+            self.last_try, self.note = started, ""
+            self._base = self._cur = 0
+            os.makedirs(self.folder, exist_ok=True)
+            cmd = self.command(s)
+            proc = self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                                errors="replace", creationflags=NOWIN, bufsize=1)
+            threading.Thread(target=self._killer, args=(proc,), daemon=True).start()
+            final, errs = None, []
+            for raw in proc.stdout:
+                line = raw.rstrip("\r\n")
+                if line.startswith("PYDMFILE|"):
+                    final = line.split("|", 1)[1].strip()
+                elif line.startswith("PYDM"):
+                    self._on_line(line)
+                elif line.startswith("ERROR:"):
+                    errs.append(line)
+            code = proc.wait()
+            if self.stop.is_set():
+                self.status = "Pausado"
+                return
+            if code != 0:
+                raise MediaError(_last_error("\n".join(errs)) or f"O yt-dlp terminou com erro (código {code}).")
+            if not final:   # não imprimiu o caminho: procura o arquivo mais novo da pasta
+                news = [os.path.join(self.folder, n) for n in os.listdir(self.folder)]
+                news = [p for p in news if os.path.isfile(p) and os.path.getmtime(p) >= started - 2]
+                final = max(news, key=os.path.getmtime) if news else None
+            if not final:
+                raise MediaError("O arquivo final não foi encontrado.")
+            if not os.path.isabs(final):
+                final = os.path.join(self.folder, final)
+            if not os.path.isfile(final):
+                raise MediaError("O arquivo final não foi encontrado.")
+            self.path, self.name = final, os.path.basename(final)
+            self.folder = os.path.dirname(final)
+            self.size = os.path.getsize(final)
+            self.last_try = time.time()
+            shutil.rmtree(self.jobdir, ignore_errors=True)
+            self.media.pop("overwrite", None)
+            self.status = "Concluído"
+        except MediaError as ex:
+            msg = str(ex)
+            self.error = ("Faltam componentes (yt-dlp). Veja Opções > Vídeo." if msg == "no_engine" else msg)
+            self.failed, self.status = True, "Erro"
+        except Exception as ex:
+            self.error, self.failed, self.status = f"{type(ex).__name__}: {ex}", True, "Erro"
+        finally:
+            self.note, self.proc = "", None
+
+    def cancel(self, delete_file=True):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+        if delete_file and self.status != "Concluído":
+            shutil.rmtree(self.jobdir, ignore_errors=True)
+
+    def reset(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=5)
+        shutil.rmtree(self.jobdir, ignore_errors=True)
+        self._base = self._cur = 0
+        self.error, self.failed, self.speed = "", False, 0.0
+        self.path, self.status = None, "Na fila"
+        self.media["overwrite"] = True   # o yt-dlp não regrava arquivos existentes, a menos que mandem
+
+
 def detect_browser(ua, browsers):
     """Identifica o navegador pelo User-Agent (primeiro que combinar, na ordem da lista)."""
     ua = (ua or "").lower()
@@ -878,8 +1261,50 @@ class Bridge(BaseHTTPRequestHandler):
         if self.path.split("?")[0] == "/config":   # a extensão monta o menu de contexto com isto
             return self._send(200, {"app": "PyDM", "version": 1,
                                     "title": s.get("menu_title") or DEFAULT_MENU_TITLE,
-                                    "menu": s.get("menu") or DEFAULT_MENU})
+                                    "menu": s.get("menu") or DEFAULT_MENU,
+                                    "video": {"enabled": bool((s.get("video") or DEFAULT_VIDEO)["enabled"])}})
         self._send(200, {"app": "PyDM", "version": 1})
+
+    def _media(self):
+        """/media/formats (lista as qualidades do vídeo da página) e /media/download (coloca na fila)."""
+        s = SETTINGS_REF["s"]
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            j = json.loads(self.rfile.read(min(n, 65536)))
+            url = str(j["url"]).strip()
+            if not url.lower().startswith(("http://", "https://")):
+                return self._send(400, {"error": "url"})
+            clean = lambda v: re.sub(r"[\r\n]", "", str(v or ""))
+            h = {}
+            for k, key in (("referrer", "Referer"), ("cookie", "Cookie"), ("userAgent", "User-Agent")):
+                if clean(j.get(k)):
+                    h[key] = clean(j.get(k))
+            mid = str(j.get("id") or "")
+            est = int(j.get("est") or 0) or None
+            title = clean(j.get("title"))[:150]
+        except Exception:
+            return self._send(400, {"error": "json"})
+        if not s or not s["video"]["enabled"]:
+            return self._send(200, {"ok": False, "error": "disabled",
+                                    "message": "O download de vídeos está desligado nas Opções do PyDM."})
+        if self.path == "/media/download":
+            if not valid_media_id(mid):
+                return self._send(400, {"error": "id"})
+            INBOX.put({"media": {"url": url, "id": mid, "title": title, "est": est, "headers": h}})
+            return self._send(200, {"ok": True})
+        try:
+            out = media_options(media_probe(url, h, s), s, media_tools(s))
+            out["ok"] = True
+            return self._send(200, out)
+        except MediaError as ex:
+            if str(ex) == "no_engine":
+                TRAY_EVENTS.put(("media_setup",))
+                return self._send(200, {"ok": False, "error": "no_engine",
+                                        "message": "Faltam componentes. Confirme a instalação na janela do PyDM."})
+            return self._send(200, {"ok": False, "error": "extract", "message": str(ex)})
+        except Exception as ex:
+            log(f"Análise de vídeo: {ex!r}")
+            return self._send(200, {"ok": False, "error": "extract", "message": f"{type(ex).__name__}: {ex}"})
 
     def do_POST(self):
         if not self._allowed():
@@ -887,6 +1312,8 @@ class Bridge(BaseHTTPRequestHandler):
         if self.path == "/show":   # outra instância do PyDM pedindo para trazer esta janela de volta
             INBOX.put({"show": True})
             return self._send(200, {"ok": True, "app": "PyDM"})
+        if self.path in ("/media/formats", "/media/download"):
+            return self._media()
         if self.path != "/add":
             return self._send(403)
         try:
@@ -1545,7 +1972,7 @@ class ProgressDialog:
         self.win.title((f"{pct:.0f}% " if pct is not None else "") + (d.name or guess_name(d.url)))
         self.v["url"].set(d.url)
         if st == "Baixando":
-            estado = "Recebendo..." if dl > 0 else "Conectando..."
+            estado = d.note or ("Recebendo..." if dl > 0 else "Conectando...")
         elif st == "Na fila":
             estado = "Na fila..."
         elif st == "Erro":
@@ -2155,6 +2582,124 @@ class AntivirusDialog(SubDialog):
         self.win.destroy()
 
 
+class ComponentInstaller:
+    """Baixa yt-dlp, Deno e ffmpeg para ~/.pydm/bin (só Windows) mostrando o progresso."""
+    LABEL = {"yt-dlp": "yt-dlp (extrai os vídeos dos sites)",
+             "deno": "Deno (necessário para o YouTube)",
+             "ffmpeg": "ffmpeg (junta vídeo e áudio e converte para MP3/WAV)"}
+
+    def __init__(self, app, names, on_done=None):
+        self.app, self.names, self.on_done = app, list(names), on_done
+        self.q, self.cancel_flag = queue.Queue(), threading.Event()
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Instalando componentes de vídeo")
+        win.transient(app.root)
+        win.resizable(False, False)
+        f = ttk.Frame(win, padding=14)
+        f.pack(fill="both", expand=True)
+        self.lbl = ttk.Label(f, text="Preparando...", width=64, justify="left")
+        self.lbl.pack(anchor="w")
+        self.bar = ttk.Progressbar(f, length=440, maximum=100)
+        self.bar.pack(fill="x", pady=10)
+        ttk.Button(f, text="Cancelar", command=self.cancel).pack()
+        win.protocol("WM_DELETE_WINDOW", self.cancel)
+        center_front(win)
+        self.finished = False
+        threading.Thread(target=self._worker, daemon=True).start()
+        self.poll()
+
+    def cancel(self):
+        self.cancel_flag.set()
+
+    # ---------- thread de download ----------
+    def _download(self, url, dest, label):
+        tmp = dest + ".part"
+        with urllib.request.urlopen(req(url), timeout=30) as r, open(tmp, "wb") as f:
+            total, got = int(r.headers.get("Content-Length") or 0), 0
+            while True:
+                if self.cancel_flag.is_set():
+                    raise InterruptedError
+                b = r.read(256 * 1024)
+                if not b:
+                    break
+                f.write(b)
+                got += len(b)
+                self.q.put(("prog", label, got, total))
+        return tmp
+
+    def _extract(self, zpath, wanted):
+        """Tira do zip só os arquivos pedidos (nome final -> sufixo do caminho dentro do zip)."""
+        import zipfile
+        with zipfile.ZipFile(zpath) as z:
+            for out, suffix in wanted.items():
+                member = next((n for n in z.namelist() if n.replace("\\", "/").endswith(suffix)), None)
+                if not member:
+                    raise IOError(f"{suffix} não foi encontrado no pacote baixado.")
+                dest = os.path.join(BIN_DIR, out)
+                with z.open(member) as src, open(dest + ".tmp", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                os.replace(dest + ".tmp", dest)
+
+    def _worker(self):
+        try:
+            os.makedirs(BIN_DIR, exist_ok=True)
+            for name in self.names:
+                label = self.LABEL[name]
+                url = COMPONENT_URLS[name]
+                tmp = self._download(url, os.path.join(BIN_DIR, name + ".download"), label)
+                self.q.put(("work", label))
+                if name == "yt-dlp":
+                    os.replace(tmp, os.path.join(BIN_DIR, "yt-dlp.exe"))
+                elif name == "deno":
+                    self._extract(tmp, {"deno.exe": "deno.exe"})
+                    os.remove(tmp)
+                else:
+                    self._extract(tmp, {"ffmpeg.exe": "/bin/ffmpeg.exe", "ffprobe.exe": "/bin/ffprobe.exe"})
+                    os.remove(tmp)
+            self.q.put(("done", True, ""))
+        except InterruptedError:
+            self.q.put(("done", False, "cancelado"))
+        except Exception as ex:
+            log(f"Instalação de componentes: {ex!r}")
+            self.q.put(("done", False, f"{type(ex).__name__}: {ex}"))
+        finally:   # sobras de downloads interrompidos
+            for n in os.listdir(BIN_DIR) if os.path.isdir(BIN_DIR) else []:
+                if n.endswith((".download", ".download.part", ".tmp")):
+                    try:
+                        os.remove(os.path.join(BIN_DIR, n))
+                    except OSError:
+                        pass
+
+    # ---------- interface ----------
+    def poll(self):
+        try:
+            while True:
+                ev = self.q.get_nowait()
+                if ev[0] == "prog":
+                    _, label, got, total = ev
+                    self.lbl.configure(text=f"Baixando {label}\n{fmt_size(got)}" + (f" de {fmt_size(total)}" if total else ""))
+                    self.bar["value"] = got * 100 / total if total else 0
+                elif ev[0] == "work":
+                    self.lbl.configure(text=f"Instalando {ev[1]}...")
+                    self.bar["value"] = 100
+                elif ev[0] == "done":
+                    self.finished = True
+                    self.win.destroy()
+                    if ev[1]:
+                        messagebox.showinfo("PyDM", "Componentes instalados.\nOs botões de vídeo já podem baixar.",
+                                            parent=self.app.root)
+                    elif ev[2] != "cancelado":
+                        messagebox.showerror("PyDM", f"Não foi possível instalar:\n{ev[2][:300]}", parent=self.app.root)
+                    if self.on_done:
+                        self.on_done()
+                    return
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return
+        self.win.after(150, self.poll)
+
+
 class OptionsDialog:
     """Opções (organizadas como no IDM): Geral, Tipos de arquivos, Salvar em, Downloads e Velocidade."""
 
@@ -2179,6 +2724,7 @@ class OptionsDialog:
         self.build_types(nb)
         self.build_save(nb)
         self.build_downloads(nb)
+        self.build_video(nb)
         self.build_speed(nb)
 
         bf = ttk.Frame(win)
@@ -2523,6 +3069,104 @@ class OptionsDialog:
     def edit_av(self):
         AntivirusDialog(self.win, self.av, lambda av: self.av.update(av))
 
+    # ================= aba Vídeo =================
+    def build_video(self, nb):
+        v = self.app.settings["video"]
+        t = ttk.Frame(nb, padding=12)
+        nb.add(t, text="Vídeo")
+        self.v_vid = tk.BooleanVar(value=v["enabled"])
+        self.v_embed = tk.BooleanVar(value=v["embed_meta"])
+        self.v_aud = {i: tk.BooleanVar(value=i in v["audio_formats"]) for i in AUDIO_PRESETS}
+        self.v_vcat, self.v_acat = tk.StringVar(value=v["video_cat"]), tk.StringVar(value=v["audio_cat"])
+        self.v_ytdlp, self.v_ffmpeg = tk.StringVar(value=v["ytdlp"]), tk.StringVar(value=v["ffmpeg"])
+
+        ttk.Checkbutton(t, text='Mostrar o botão "Baixar este vídeo" sobre os vídeos das páginas (precisa da extensão)',
+                        variable=self.v_vid).pack(anchor="w")
+        lf = ttk.LabelFrame(t, text="Formatos de áudio oferecidos no painel", padding=8)
+        lf.pack(fill="x", pady=8)
+        for n, (i, p) in enumerate(AUDIO_PRESETS.items()):
+            ttk.Checkbutton(lf, text=p["label"], variable=self.v_aud[i]).grid(row=n // 2, column=n % 2, sticky="w",
+                                                                              padx=(0, 28), pady=1)
+        ttk.Checkbutton(t, text="Gravar título, artista e capa nos arquivos de áudio",
+                        variable=self.v_embed).pack(anchor="w")
+        cats = list(self.cats)
+        for text, var in (("Salvar vídeos na categoria:", self.v_vcat), ("Salvar áudios na categoria:", self.v_acat)):
+            r = ttk.Frame(t)
+            r.pack(anchor="w", pady=(6, 0))
+            ttk.Label(r, text=text, width=28).pack(side="left")
+            ttk.Combobox(r, textvariable=var, values=cats, state="readonly", width=20).pack(side="left")
+
+        cf = ttk.LabelFrame(t, text="Componentes (o PyDM usa estes programas para baixar vídeos de sites)", padding=8)
+        cf.pack(fill="x", pady=10)
+        self.lbl_comp = ttk.Label(cf, justify="left")
+        self.lbl_comp.pack(anchor="w")
+        for text, var in (("yt-dlp:", self.v_ytdlp), ("ffmpeg:", self.v_ffmpeg)):
+            r = ttk.Frame(cf)
+            r.pack(fill="x", pady=(6, 0))
+            ttk.Label(r, text=text, width=9).pack(side="left")
+            ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True)
+            ttk.Button(r, text="...", width=3, command=lambda v=var: self.pick_tool(v)).pack(side="left", padx=(6, 0))
+        ttk.Label(cf, text="Em branco = o PyDM procura sozinho (pasta .pydm\\bin ou PATH).",
+                  foreground="#555555").pack(anchor="w", pady=(2, 6))
+        r = ttk.Frame(cf)
+        r.pack(fill="x")
+        ttk.Button(r, text="Instalar / completar componentes", command=self.install_components).pack(side="left")
+        ttk.Button(r, text="Atualizar yt-dlp", command=self.update_ytdlp).pack(side="left", padx=8)
+        self.refresh_components()
+
+    def tools_now(self):
+        return {"yt-dlp": find_tool("yt-dlp", self.v_ytdlp.get().strip()),
+                "ffmpeg": find_tool("ffmpeg", self.v_ffmpeg.get().strip()), "deno": find_tool("deno")}
+
+    def refresh_components(self):
+        info = {"yt-dlp": "extrai os vídeos", "ffmpeg": "junta vídeo+áudio e converte", "deno": "necessário no YouTube"}
+        lines = []
+        for name, path in self.tools_now().items():
+            lines.append(("\u2714 " if path else "\u2718 ") + f"{name}  ({info[name]}): " + (path or "não encontrado"))
+        self.lbl_comp.configure(text="\n".join(lines))
+
+    def pick_tool(self, var):
+        p = filedialog.askopenfilename(parent=self.win, title="Escolha o programa",
+                                       filetypes=[("Programas", "*.exe"), ("Todos os arquivos", "*.*")])
+        if p:
+            var.set(os.path.normpath(p))
+            self.refresh_components()
+
+    def install_components(self):
+        if not sys.platform.startswith("win"):
+            messagebox.showinfo("PyDM", "Instale o yt-dlp, o ffmpeg e o Deno pelo gerenciador de pacotes do seu sistema.",
+                                parent=self.win)
+            return
+        missing = [n for n, p in self.tools_now().items() if not p]
+        if not missing:
+            if not messagebox.askyesno("PyDM", "Todos os componentes já foram encontrados.\n"
+                                               "Baixar de novo para atualizar? (cerca de 230 MB)", parent=self.win):
+                return
+            missing = ["yt-dlp", "deno", "ffmpeg"]
+        sizes = {"yt-dlp": "~20 MB", "deno": "~40 MB", "ffmpeg": "~190 MB"}
+        if messagebox.askyesno("PyDM", "Baixar agora do GitHub:\n\n" +
+                               "\n".join(f"\u2022 {ComponentInstaller.LABEL[n]}  {sizes[n]}" for n in missing),
+                               parent=self.win):
+            ComponentInstaller(self.app, missing, on_done=self.refresh_components)
+
+    def update_ytdlp(self):
+        tool = self.tools_now()["yt-dlp"]
+        if not tool:
+            messagebox.showinfo("PyDM", "O yt-dlp ainda não está instalado. Use \"Instalar / completar componentes\".",
+                                parent=self.win)
+            return
+
+        def work():
+            try:
+                r = subprocess.run([tool, "-U"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                   timeout=180, stdin=subprocess.DEVNULL, creationflags=NOWIN)
+                TRAY_EVENTS.put(("ytdlp_update", r.returncode, (r.stdout or "") + (r.stderr or "")))
+            except Exception as ex:
+                TRAY_EVENTS.put(("ytdlp_update", None, str(ex)))
+        threading.Thread(target=work, daemon=True).start()
+        messagebox.showinfo("PyDM", "Verificando atualização do yt-dlp... O resultado aparece em instantes.",
+                            parent=self.win)
+
     # ================= aba Velocidade =================
     def build_speed(self, nb):
         s = self.app.settings
@@ -2603,6 +3247,13 @@ class OptionsDialog:
         s["manual_ua"] = self.v_ua.get().strip() or UA
         s["progress_ui"] = dict(self.prog_ui)
         s["antivirus"] = dict(self.av)
+
+        # vídeo
+        v = s["video"]
+        v["enabled"], v["embed_meta"] = bool(self.v_vid.get()), bool(self.v_embed.get())
+        v["audio_formats"] = [i for i in AUDIO_PRESETS if self.v_aud[i].get()]
+        v["video_cat"], v["audio_cat"] = self.v_vcat.get(), self.v_acat.get()
+        v["ytdlp"], v["ffmpeg"] = self.v_ytdlp.get().strip(), self.v_ffmpeg.get().strip()
 
         # início automático com o Windows (fica no registro, não no settings.json)
         want = bool(self.v_auto.get())
@@ -3065,7 +3716,8 @@ class App:
             "vel": pt(fmt_size(d.speed, 2)) + "/s" if running and d.speed else "",
             "data": time.strftime("%b %d %H:%M:%S %Y", time.localtime(d.last_try)) if d.last_try else "",
             "desc": d.description,
-            "status": d.status + (f": {d.error[:40]}" if d.status == "Erro" and d.error else ""),
+            "status": d.status + (f": {d.error[:40]}" if d.status == "Erro" and d.error else
+                                  f": {d.note}" if d.status == "Baixando" and d.note else ""),
             "pasta": d.folder,
             "url": d.url,
         }
@@ -3175,7 +3827,7 @@ class App:
     def load(self):
         try:
             with open(DB, encoding="utf-8") as f:
-                self.items = [Download.from_dict(d) for d in json.load(f)]
+                self.items = [(MediaDownload if d.get("media") else Download).from_dict(d) for d in json.load(f)]
         except Exception:
             self.items = []
         for d in self.items:   # itens de versões antigas não tinham categoria
@@ -3280,6 +3932,44 @@ class App:
         win.bind("<Escape>", lambda _e: win.destroy())
         e.focus()
         e.select_range(0, "end")
+
+    def add_media(self, m):
+        """Coloca na lista um vídeo/áudio escolhido no painel da extensão."""
+        s = self.settings
+        cats, v = s["categories"], s["video"]
+        mid = m["id"]
+        audio = not mid.startswith("v")
+        cat = v["audio_cat"] if audio else v["video_cat"]
+        if cat not in cats:
+            cat = category_for("x.mp3" if audio else "x.mp4", cats)
+        if audio:
+            ext, suffix = (AUDIO_PRESETS[mid]["ext"] if mid in AUDIO_PRESETS else "m4a"), ""
+        else:
+            h = int(mid[1:])
+            ext, suffix = ("mkv" if h > 1080 else "mp4"), f" [{h}p]"
+        d = MediaDownload(m["url"], cats[cat]["folder"], 1, m.get("headers"), media={"id": mid, "title": m.get("title", "")})
+        d.name = f"{m.get('title') or guess_name(m['url'])}{suffix}.{ext}"
+        d.size, d.category, d.status = m.get("est"), cat, "Na fila"
+        self.items.append(d)
+        self.save()
+        log(f"Vídeo adicionado: {mid} {m['url'][:100]}")
+        return d
+
+    def offer_components(self):
+        """A extensão pediu um vídeo mas falta o yt-dlp: oferece instalar (no máximo a cada 90 s)."""
+        if time.time() - getattr(self, "_comp_ask", 0) < 90:
+            return
+        self._comp_ask = time.time()
+        if not sys.platform.startswith("win"):
+            messagebox.showinfo("PyDM", "Para baixar vídeos de sites instale o yt-dlp (e o ffmpeg) pelo gerenciador "
+                                        "de pacotes do seu sistema.", parent=self.root)
+            return
+        missing = [n for n, p in media_tools_named(self.settings).items() if not p]
+        if missing and messagebox.askyesno(
+                "PyDM", "Para baixar vídeos de sites o PyDM precisa instalar alguns componentes do GitHub:\n\n" +
+                "\n".join(f"\u2022 {ComponentInstaller.LABEL[n]}" for n in missing) +
+                "\n\nBaixar agora? (até ~250 MB, só na primeira vez)", parent=self.root):
+            ComponentInstaller(self, missing)
 
     def apply_runtime(self):
         """Passa para o motor de download as opções que ele consulta durante o download."""
@@ -3545,8 +4235,11 @@ class App:
         return "break"
 
     def export_list(self):
-        if not self.items:
-            messagebox.showinfo("PyDM", "A lista de downloads está vazia.", parent=self.root)
+        items = [d for d in self.items if not isinstance(d, MediaDownload)]   # vídeos do painel dependem do formato escolhido
+        skipped = len(self.items) - len(items)
+        if not items:
+            messagebox.showinfo("PyDM", "Não há downloads para exportar" +
+                                (" (os vídeos do painel não entram na exportação)." if skipped else "."), parent=self.root)
             return
         p = filedialog.asksaveasfilename(parent=self.root, title="Exportar lista de downloads",
                                          defaultextension=".json", initialfile="pydm-downloads.json",
@@ -3556,13 +4249,17 @@ class App:
         try:
             with open(p, "w", encoding="utf-8") as f:
                 if p.lower().endswith(".txt"):
-                    f.write("\n".join(d.url for d in self.items) + "\n")
+                    f.write("\n".join(d.url for d in items) + "\n")
                 else:   # os cookies/headers de sessão não são exportados, de propósito
                     json.dump([{"url": d.url, "name": d.name, "folder": d.folder, "category": d.category,
                                 "description": d.description, "size": d.size, "status": d.status}
-                               for d in self.items], f, ensure_ascii=False, indent=2)
+                               for d in items], f, ensure_ascii=False, indent=2)
         except OSError as ex:
             messagebox.showerror("Erro", f"Não foi possível salvar o arquivo:\n{ex}", parent=self.root)
+            return
+        if skipped:
+            messagebox.showinfo("PyDM", f"{skipped} vídeo(s) baixados pelo painel da extensão não foram exportados.",
+                                parent=self.root)
 
     def import_list(self):
         p = filedialog.askopenfilename(parent=self.root, title="Importar lista de downloads",
@@ -3769,6 +4466,12 @@ class App:
             if j.get("show"):   # segunda instância pediu para mostrar a janela
                 self.show_window()
                 continue
+            if j.get("media"):   # botão "Baixar este vídeo" da extensão
+                try:
+                    self.add_media(j["media"])
+                except Exception as ex:
+                    log(f"Vídeo: {ex!r}")
+                continue
             try:
                 self.on_new_link(j["url"], j["headers"])
             except Exception:
@@ -3912,6 +4615,11 @@ class App:
                     self.finish_install(ev[1], ev[2])
                 elif isinstance(ev, tuple) and ev[0] == "av":
                     self.show_av_result(ev[1], ev[2], ev[3])
+                elif isinstance(ev, tuple) and ev[0] == "media_setup":
+                    self.offer_components()
+                elif isinstance(ev, tuple) and ev[0] == "ytdlp_update":
+                    out = (ev[2] or "").strip()[-600:] or "(sem saída)"
+                    messagebox.showinfo("yt-dlp", out, parent=self.root)
                 elif ev == "show":
                     self.show_window()
                 elif ev == "quit":
