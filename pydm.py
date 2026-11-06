@@ -2593,7 +2593,9 @@ class ComponentInstaller:
         self.q, self.cancel_flag = queue.Queue(), threading.Event()
         win = self.win = tk.Toplevel(app.root)
         win.title("Instalando componentes de vídeo")
-        win.transient(app.root)
+        # uma janela "transient" de um pai escondido (bandeja ou modo --install-components) também some
+        if app.root.winfo_viewable():
+            win.transient(app.root)
         win.resizable(False, False)
         f = ttk.Frame(win, padding=14)
         f.pack(fill="both", expand=True)
@@ -4772,7 +4774,33 @@ class App:
         self.root.destroy()
 
 
+def install_components_cli():
+    """PyDM.exe --install-components: chamado pelo instalador (installer.iss) no fim da instalação.
+    Abre só a janela de progresso do ComponentInstaller (sem a janela principal) e baixa o que faltar
+    em ~/.pydm/bin. Se já estiver tudo instalado, não faz nada."""
+    if not sys.platform.startswith("win"):
+        return
+    from types import SimpleNamespace
+    missing = [n for n, p in media_tools_named(load_cfg()).items() if not p]
+    if not missing:
+        log("--install-components: todos os componentes já estavam instalados")
+        return
+    root = tk.Tk()
+    root.withdraw()
+
+    def _tk_error(exc, val, tb):
+        import traceback
+        log("Erro no instalador de componentes:\n" + "".join(traceback.format_exception(exc, val, tb)))
+    root.report_callback_exception = _tk_error
+    log(f"--install-components: baixando {', '.join(missing)}")
+    ComponentInstaller(SimpleNamespace(root=root), missing, on_done=root.destroy)
+    root.mainloop()
+
+
 if __name__ == "__main__":
+    if "--install-components" in sys.argv:   # antes do "já está rodando": o instalador pode rodar com o PyDM aberto
+        install_components_cli()
+        sys.exit(0)
     if already_running():   # já existe um PyDM (provavelmente na bandeja): ele mostra a janela
         sys.exit(0)
     root = tk.Tk()
