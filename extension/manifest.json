@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "PyDM - Integração com o navegador",
+  "version": "1.2",
+  "description": "Captura os downloads do navegador e envia para o PyDM.",
+  "permissions": ["downloads", "cookies", "contextMenus", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["keys.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["video.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_title": "PyDM (clique para ativar/desativar)",
+    "default_icon": { "16": "icons/16.png", "48": "icons/48.png" }
+  },
+  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+}
