@@ -1,5 +1,5 @@
 // Content script: informa ao background quais teclas (Ctrl/Alt/Shift) estavam
-// pressionadas no último clique. O PyDM usa isso para "impedir" ou "forçar" a captura.
+// pressionadas no último clique. O Raio usa isso para "impedir" ou "forçar" a captura.
 function mods(e) {
   const m = [];
   if (e.ctrlKey) m.push("Ctrl");
