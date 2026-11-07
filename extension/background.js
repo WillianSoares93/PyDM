@@ -2,7 +2,7 @@ const API = "http://127.0.0.1:9614";
 const MODS_TTL = 3000;   // ms: por quanto tempo vale a tecla segurada no último clique
 const CONTEXTS = ["link", "video", "audio", "image", "page", "selection"];
 const DEFAULT_CFG = {
-  title: "Baixar com PyDM",
+  title: "Baixar com o Raio",
   menu: { link: true, video: true, audio: true, image: true, page: false }
 };
 
@@ -45,9 +45,9 @@ async function pydmJson(path, body, timeoutMs) {
   }
 }
 
-const OFFLINE = { ok: false, error: "offline", message: "Não consegui falar com o PyDM. Ele está aberto?" };
+const OFFLINE = { ok: false, error: "offline", message: "Não consegui falar com o Raio. Ele está aberto?" };
 
-// Dados do navegador que o PyDM usa (no YouTube o yt-dlp usa as próprias identidades, então não manda cookies).
+// Dados do navegador que o Raio usa (no YouTube o yt-dlp usa as próprias identidades, então não manda cookies).
 async function pageInfo(msg) {
   const url = String(msg.url || "");
   if (!/^https?:\/\//i.test(url)) throw new Error("url");
@@ -58,7 +58,7 @@ async function pageInfo(msg) {
 }
 
 const HANDLERS = {
-  // o painel só aparece se o PyDM estiver aberto e com o recurso ligado nas Opções
+  // o painel só aparece se o Raio estiver aberto e com o recurso ligado nas Opções
   "video-config": async () => {
     try {
       const c = await pydmJson("/config", null, 1500);
@@ -67,12 +67,12 @@ const HANDLERS = {
       return { online: false, enabled: false };
     }
   },
-  // lista as qualidades de vídeo e os formatos de áudio (o PyDM roda o yt-dlp; pode levar alguns segundos)
+  // lista as qualidades de vídeo e os formatos de áudio (o Raio roda o yt-dlp; pode levar alguns segundos)
   "media-formats": async (msg) => pydmJson("/media/formats", await pageInfo(msg), 120000),
   "media-download": async (msg) => pydmJson("/media/download", {
     ...(await pageInfo(msg)), id: String(msg.id || ""), title: String(msg.title || ""), est: Number(msg.est) || 0
   }, 10000),
-  // arquivo de vídeo com endereço direto: baixa pelo motor normal do PyDM
+  // arquivo de vídeo com endereço direto: baixa pelo motor normal do Raio
   "download-direct": async (msg) => {
     const ok = await sendToPyDM(String(msg.url || ""), String(msg.referrer || ""), { manual: true });
     return { ok };
@@ -91,7 +91,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;                              // resposta assíncrona
 });
 
-// Retorna true se o PyDM aceitou o link. 409 = PyDM ignorou (filtros/teclas): o navegador baixa normalmente.
+// Retorna true se o Raio aceitou o link. 409 = Raio ignorou (filtros/teclas): o navegador baixa normalmente.
 async function sendToPyDM(url, referrer, extra) {
   const cookies = await chrome.cookies.getAll({ url });
   const cookie = cookies.map(c => `${c.name}=${c.value}`).join("; ");
@@ -118,11 +118,11 @@ chrome.downloads.onCreated.addListener(async (item) => {
       await chrome.downloads.erase({ id: item.id });
     }
   } catch (e) {
-    // PyDM fechado: o navegador continua o download normalmente
+    // Raio fechado: o navegador continua o download normalmente
   }
 });
 
-// ---------- menu de clique direito (configurado nas Opções do PyDM) ----------
+// ---------- menu de clique direito (configurado nas Opções do Raio) ----------
 let syncing = Promise.resolve();
 function syncMenu(force) {
   syncing = syncing.then(() => doSync(force)).catch(() => {});
@@ -137,7 +137,7 @@ async function doSync(force) {
     if (!r.ok) throw new Error("http " + r.status);
     cfg = await r.json();
   } catch (e) {
-    if (!force) return;                          // PyDM fechado: mantém o menu atual
+    if (!force) return;                          // Raio fechado: mantém o menu atual
     cfg = saved || DEFAULT_CFG;
   }
   if (!force && JSON.stringify(cfg) === JSON.stringify(saved)) return;   // nada mudou
@@ -163,7 +163,7 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
     await sendToPyDM(url, info.pageUrl, { manual: true });   // menu de contexto: ignora os filtros
     badge("✓", "#188038");
   } catch (e) {
-    badge("!", "#d93025");                      // PyDM não está aberto
+    badge("!", "#d93025");                      // Raio não está aberto
   }
   setTimeout(refreshBadge, 3000);
 });
