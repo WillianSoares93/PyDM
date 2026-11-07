@@ -1,5 +1,5 @@
 // Botão "Baixar este vídeo" sobre os <video> da página, com painel de qualidades (vídeo) e formatos de áudio.
-// Quem analisa e baixa é o PyDM (via background.js). Este script só desenha a interface.
+// Quem analisa e baixa é o Raio (via background.js). Este script só desenha a interface.
 (() => {
   "use strict";
   if (globalThis.__pydmVideoLoaded) return;
@@ -216,14 +216,14 @@
       busy = true;
       const r = await send({ type: "download-direct", url: u, referrer: document.referrer || location.href });
       busy = false;
-      done(r && r.ok, "Adicionado ao PyDM", r && r.message);
+      done(r && r.ok, "Adicionado ao Raio", r && r.message);
     });
     return row;
   }
 
   function render(res, direct) {
     if (!res || res.ok === false) {
-      const text = !res ? "Não consegui falar com o PyDM. Ele está aberto?" :
+      const text = !res ? "Não consegui falar com o Raio. Ele está aberto?" :
         (res.message || "Não foi possível analisar este vídeo.");
       const parts = [header("Baixar este vídeo"), el("div", "msg err", text)];
       if (direct.length) {
@@ -245,11 +245,11 @@
     }
     if (!res.ffmpeg) {
       parts.push(el("div", "warn", "Sem o ffmpeg só aparecem as qualidades que já trazem som e não dá para " +
-        "converter em MP3/WAV. Instale em PyDM > Opções > Vídeo."));
+        "converter em MP3/WAV. Instale em Raio > Opções > Vídeo."));
     }
     if (res.deno === false && /(^|\.)youtube\.com$/i.test(location.hostname)) {
       parts.push(el("div", "warn", "O YouTube exige o Deno para liberar todas as qualidades. " +
-        "Instale em PyDM > Opções > Vídeo."));
+        "Instale em Raio > Opções > Vídeo."));
     }
     panel.replaceChildren(...parts);
   }
@@ -263,16 +263,16 @@
       id: opt.id, title, est: opt.size || 0
     });
     busy = false;
-    done(r && r.ok, "Adicionado ao PyDM: " + opt.label, r && r.message);
+    done(r && r.ok, "Adicionado ao Raio: " + opt.label, r && r.message);
   }
 
   function done(ok, okText, errText) {
     if (!panelOpen) return;
     if (ok) {
-      showMessage("PyDM", "\u2713 " + okText, "ok");
+      showMessage("Raio", "\u2713 " + okText, "ok");
       setTimeout(() => { if (panelOpen) closePanel(); }, 1600);
     } else {
-      showMessage("PyDM", errText || "Não foi possível enviar ao PyDM. Ele está aberto?", "err");
+      showMessage("Raio", errText || "Não foi possível enviar ao Raio. Ele está aberto?", "err");
     }
   }
 
