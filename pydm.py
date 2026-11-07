@@ -2702,6 +2702,118 @@ class ComponentInstaller:
         self.win.after(150, self.poll)
 
 
+def extension_dir():
+    """Pasta da extensão do navegador (a que contém o manifest.json): ao lado do PyDM.exe / pydm.py."""
+    base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.path.join(base, "extension"), os.path.join(base, "extension", "extension")):
+        if os.path.isfile(os.path.join(p, "manifest.json")):
+            return p
+    return None
+
+
+def find_browser(key):
+    """Caminho do chrome.exe ou msedge.exe (só Windows). None se não estiver instalado."""
+    if not sys.platform.startswith("win"):
+        return None
+    exe = {"chrome": "chrome.exe", "edge": "msedge.exe"}[key]
+    try:
+        import winreg
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as k:
+                    p = winreg.QueryValue(k, None)
+                    if p and os.path.isfile(p):
+                        return p
+            except OSError:
+                pass
+    except Exception:
+        pass
+    rel = {"chrome": r"Google\Chrome\Application\chrome.exe", "edge": r"Microsoft\Edge\Application\msedge.exe"}[key]
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "LocalAppData"):
+        base = os.environ.get(var)
+        if base and os.path.isfile(os.path.join(base, rel)):
+            return os.path.join(base, rel)
+    return None
+
+
+class ExtensionDialog:
+    """Passo a passo para instalar a extensão no Chrome/Edge. Os navegadores não deixam um programa instalar
+    extensões sozinho, então o PyDM facilita: abre a página de extensões e mostra a pasta que deve ser carregada."""
+    PAGES = {"chrome": "chrome://extensions", "edge": "edge://extensions"}
+
+    def __init__(self, app, on_close=None):
+        self.app, self.on_close = app, on_close
+        self.path = extension_dir()
+        win = self.win = tk.Toplevel(app.root)
+        win.title("Instalar a extensão do navegador")
+        if app.root.winfo_viewable():   # "transient" de um pai escondido (bandeja ou --install-extension) some junto
+            win.transient(app.root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        win.bind("<Escape>", lambda e: self.close())
+        f = ttk.Frame(win, padding=14)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, justify="left", wraplength=540,
+                  text="A extensão liga o navegador ao PyDM: captura os downloads e mostra o botão \"Baixar este "
+                       "vídeo\". O Chrome e o Edge não deixam programas instalarem extensões sozinhos, então são "
+                       "4 passos rápidos (só na primeira vez):").pack(anchor="w")
+
+        def step(n, text):
+            r = ttk.Frame(f)
+            r.pack(fill="x", pady=(12, 0))
+            ttk.Label(r, text=f"{n}.", width=3, font=("Segoe UI", 10, "bold")).pack(side="left", anchor="n")
+            ttk.Label(r, text=text, justify="left", wraplength=510).pack(side="left", anchor="w")
+            b = ttk.Frame(f)
+            b.pack(fill="x", padx=(26, 0), pady=(4, 0))
+            return b
+
+        b = step(1, "Abra a página de extensões do navegador (ou digite chrome://extensions ou "
+                    "edge://extensions na barra de endereços):")
+        for key, label in (("chrome", "Abrir no Chrome"), ("edge", "Abrir no Edge")):
+            ttk.Button(b, text=label, command=lambda k=key: self.open_page(k),
+                       state="normal" if find_browser(key) else "disabled").pack(side="left", padx=(0, 8))
+        step(2, "Ative o \"Modo do desenvolvedor\" (chave no canto da página).")
+        step(3, "Clique em \"Carregar sem compactação\" (em inglês: \"Load unpacked\").")
+        b = step(4, "Na janela que abrir, escolha esta pasta:")
+        self.path_var = tk.StringVar(value=self.path or "Pasta da extensão não encontrada ao lado do PyDM.")
+        ttk.Entry(b, state="readonly", textvariable=self.path_var, width=62).pack(fill="x", pady=(0, 6))
+        ok = "normal" if self.path else "disabled"
+        ttk.Button(b, text="Copiar caminho", command=self.copy_path, state=ok).pack(side="left", padx=(0, 8))
+        ttk.Button(b, text="Abrir a pasta", command=self.open_folder, state=ok).pack(side="left")
+        ttk.Label(f, justify="left", wraplength=540, foreground="#555555",
+                  text="Pronto: o ícone do PyDM aparece na barra do navegador. Ao abrir o Chrome, ele pode avisar sobre "
+                       "extensões do modo desenvolvedor; é só manter a extensão ativada.").pack(anchor="w", pady=(14, 0))
+        ttk.Button(f, text="Fechar", width=14, command=self.close).pack(pady=(12, 0))
+        center_front(win)
+
+    def open_page(self, key):
+        exe = find_browser(key)
+        if not exe:
+            return
+        try:
+            subprocess.Popen([exe, self.PAGES[key]])
+        except Exception as ex:
+            log(f"Extensão: não abriu {key}: {ex!r}")
+            messagebox.showerror("PyDM", f"Não foi possível abrir o navegador:\n{ex}", parent=self.win)
+
+    def copy_path(self):
+        self.win.clipboard_clear()
+        self.win.clipboard_append(self.path)
+        self.win.update()
+
+    def open_folder(self):
+        App._open(self.path)
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        if self.on_close:
+            self.on_close()
+
+
 class OptionsDialog:
     """Opções (organizadas como no IDM): Geral, Tipos de arquivos, Salvar em, Downloads e Velocidade."""
 
@@ -2763,6 +2875,7 @@ class OptionsDialog:
         self.lbl_bridge = ttk.Label(r, text=self.bridge_text())
         self.lbl_bridge.pack(side="left")
         ttk.Button(r, text="Reiniciar", command=self.restart_bridge).pack(side="right")
+        ttk.Button(r, text="Instalar extensão...", command=lambda: ExtensionDialog(self.app)).pack(side="right", padx=(0, 6))
         ttk.Checkbutton(lf, text="Iniciar o PyDM automaticamente com o Windows (direto na bandeja)",
                         variable=self.v_auto,
                         state="normal" if sys.platform.startswith("win") else "disabled").pack(anchor="w", pady=(6, 1))
@@ -3440,6 +3553,8 @@ class App:
         t.add_separator()
         item(t, None, "Exportar lista de downloads...", self.export_list)
         item(t, None, "Importar lista de downloads...", self.import_list)
+        t.add_separator()
+        item(t, None, "Instalar extensão do navegador...", self.extension_dialog)
         t.add_separator()
         item(t, None, "Sair", self.request_quit)
 
@@ -4293,6 +4408,9 @@ class App:
     def scheduler_dialog(self):
         SchedulerDialog(self)
 
+    def extension_dialog(self):
+        ExtensionDialog(self)
+
     def show_properties(self):
         sel = self.selected()
         if sel:
@@ -4797,7 +4915,25 @@ def install_components_cli():
     root.mainloop()
 
 
+def install_extension_cli():
+    """PyDM.exe --install-extension: chamado pelo instalador (último passo) e pelo menu. Abre só o passo a
+    passo de instalação da extensão, sem a janela principal."""
+    root = tk.Tk()
+    root.withdraw()
+
+    def _tk_error(exc, val, tb):
+        import traceback
+        log("Erro no passo a passo da extensão:\n" + "".join(traceback.format_exception(exc, val, tb)))
+    root.report_callback_exception = _tk_error
+    from types import SimpleNamespace
+    ExtensionDialog(SimpleNamespace(root=root), on_close=root.destroy)
+    root.mainloop()
+
+
 if __name__ == "__main__":
+    if "--install-extension" in sys.argv:
+        install_extension_cli()
+        sys.exit(0)
     if "--install-components" in sys.argv:   # antes do "já está rodando": o instalador pode rodar com o PyDM aberto
         install_components_cli()
         sys.exit(0)
