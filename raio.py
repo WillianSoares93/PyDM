@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PyDM - Gerenciador de downloads estilo IDM
+Raio - Gerenciador de downloads
 - Download segmentado (várias conexões por arquivo)
 - Pausar / retomar (inclusive após fechar o programa)
 - Fila com limite de downloads simultâneos
@@ -10,15 +10,15 @@ PyDM - Gerenciador de downloads estilo IDM
 - Janela de progresso ao iniciar (estado, velocidade, tempo restante e progresso por conexão)
   e janela "Download completo" (Abrir / Abrir com... / Abrir pasta / Fechar)
 - Aba "Limitar velocidade" (limite em KB/s, ajustável durante o download)
-- Aba "Opções ao concluir" (mensagem, desconectar modem, sair do PyDM, desligar/reiniciar/hibernar/suspender)
+- Aba "Opções ao concluir" (mensagem, desconectar modem, sair do Raio, desligar/reiniciar/hibernar/suspender)
 - Segmentação dinâmica: quando uma conexão termina, ela "rouba" metade do trecho
   restante da mais lenta, mantendo todas as conexões ocupadas até o fim
 - Janela principal no estilo do IDM: menus (Tarefas, Arquivo, Downloads, Visualizar), barra de ferramentas
   com ícones, painel de categorias (Todos / Incompletos / Completos / Tarefas) e lista ordenável com colunas
 - Fila principal, agendador (início/fim em horários e dias), limite de velocidade total, janela de Opções,
   download em lote, exportar/importar lista, propriedades, mover/renomear, baixar novamente
-- Ao fechar a janela o PyDM continua na bandeja do sistema (botão direito no ícone > Sair para encerrar)
-- Instância única: abrir o PyDM de novo só traz a janela existente de volta
+- Ao fechar a janela o Raio continua na bandeja do sistema (botão direito no ícone > Sair para encerrar)
+- Instância única: abrir o Raio de novo só traz a janela existente de volta
 Requer Python 3.8+ (tkinter já vem instalado na maioria dos sistemas).
 Opcional: "pip install pystray pillow" habilita o ícone da bandeja. Sem eles, fechar a janela
 encerra o programa, como antes.
@@ -80,13 +80,13 @@ DEFAULT_KEYS = {"prevent": "Alt", "force": "Ctrl+Alt"}
 DEFAULT_MENU = {"link": True, "video": True, "audio": True, "image": True, "page": False}
 MENU_LABELS = (("link", "Links"), ("video", "Vídeos"), ("audio", "Áudios"), ("image", "Imagens"),
                ("page", "Página (clique em área vazia)"))
-DEFAULT_MENU_TITLE = "Baixar com PyDM"
+DEFAULT_MENU_TITLE = "Baixar com o Raio"
 DEFAULT_PROGRESS_UI = {"speed_tab": True, "done_tab": True, "details": True}
 DEFAULT_AV = {"enabled": False, "program": "", "args": '-Scan -ScanType 3 -File "{file}"'}
 DUP_ACTIONS = (("ask", "Mostrar uma caixa de diálogo e perguntar o que fazer"),
                ("rename", "Adicionar mesmo assim (com outro nome se o arquivo já existir)"),
                ("ignore", "Ignorar o link duplicado"))
-BIN_DIR = os.path.join(APP_DIR, "bin")        # yt-dlp, ffmpeg e deno instalados pelo PyDM
+BIN_DIR = os.path.join(APP_DIR, "bin")        # yt-dlp, ffmpeg e deno instalados pelo Raio
 MEDIA_DIR = os.path.join(APP_DIR, "media")    # arquivos temporários de cada download de vídeo
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "googlevideo.com")
 COMPONENT_URLS = {
@@ -819,7 +819,7 @@ TRAY_EVENTS = queue.Queue()  # eventos do menu da bandeja (vêm de outra thread)
 
 # ====================================================================================
 #  Vídeo e áudio de páginas (botão "Baixar este vídeo" da extensão)
-#  O PyDM não extrai vídeos sozinho: ele usa o yt-dlp (extrai/baixa) com o ffmpeg (junta e converte)
+#  O Raio não extrai vídeos sozinho: ele usa o yt-dlp (extrai/baixa) com o ffmpeg (junta e converte)
 #  e o Deno (necessário para o YouTube). Os três ficam em ~/.pydm/bin ou no PATH.
 # ====================================================================================
 class MediaError(Exception):
@@ -849,7 +849,7 @@ def media_tools_named(s):
 
 
 def valid_media_id(mid):
-    """O navegador só escolhe entre opções que o PyDM mesmo ofereceu: nunca passa argumentos soltos ao yt-dlp."""
+    """O navegador só escolhe entre opções que o Raio mesmo ofereceu: nunca passa argumentos soltos ao yt-dlp."""
     return bool(re.fullmatch(r"v\d{3,4}", mid)) or mid in AUDIO_PRESETS or mid == "orig"
 
 
@@ -1190,9 +1190,9 @@ def _match(value, patterns, prefix=False):
 
 
 def capture_decision(s, url, filename="", ua="", mods="", manual=False):
-    """Decide se um link enviado pela extensão deve ser capturado pelo PyDM. Retorna (aceito, motivo).
+    """Decide se um link enviado pela extensão deve ser capturado pelo Raio. Retorna (aceito, motivo).
     Se não for aceito, a Bridge responde 409 e a extensão deixa o navegador baixar normalmente."""
-    if manual:                       # "Baixar com PyDM" no menu de contexto: sempre baixa
+    if manual:                       # "Baixar com o Raio" no menu de contexto: sempre baixa
         return True, ""
     b = detect_browser(ua, s["browsers"])
     if b and not b["on"]:
@@ -1261,11 +1261,11 @@ class Bridge(BaseHTTPRequestHandler):
             return self._send(403)
         s = SETTINGS_REF["s"] or {}
         if self.path.split("?")[0] == "/config":   # a extensão monta o menu de contexto com isto
-            return self._send(200, {"app": "PyDM", "version": 1,
+            return self._send(200, {"app": "Raio", "version": 1,
                                     "title": s.get("menu_title") or DEFAULT_MENU_TITLE,
                                     "menu": s.get("menu") or DEFAULT_MENU,
                                     "video": {"enabled": bool((s.get("video") or DEFAULT_VIDEO)["enabled"])}})
-        self._send(200, {"app": "PyDM", "version": 1})
+        self._send(200, {"app": "Raio", "version": 1})
 
     def _media(self):
         """/media/formats (lista as qualidades do vídeo da página) e /media/download (coloca na fila)."""
@@ -1288,7 +1288,7 @@ class Bridge(BaseHTTPRequestHandler):
             return self._send(400, {"error": "json"})
         if not s or not s["video"]["enabled"]:
             return self._send(200, {"ok": False, "error": "disabled",
-                                    "message": "O download de vídeos está desligado nas Opções do PyDM."})
+                                    "message": "O download de vídeos está desligado nas Opções do Raio."})
         if self.path == "/media/download":
             if not valid_media_id(mid):
                 return self._send(400, {"error": "id"})
@@ -1302,7 +1302,7 @@ class Bridge(BaseHTTPRequestHandler):
             if str(ex) == "no_engine":
                 TRAY_EVENTS.put(("media_setup",))
                 return self._send(200, {"ok": False, "error": "no_engine",
-                                        "message": "Faltam componentes. Confirme a instalação na janela do PyDM."})
+                                        "message": "Faltam componentes. Confirme a instalação na janela do Raio."})
             return self._send(200, {"ok": False, "error": "extract", "message": str(ex)})
         except Exception as ex:
             log(f"Análise de vídeo: {ex!r}")
@@ -1311,9 +1311,9 @@ class Bridge(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._allowed():
             return self._send(403)
-        if self.path == "/show":   # outra instância do PyDM pedindo para trazer esta janela de volta
+        if self.path == "/show":   # outra instância do Raio pedindo para trazer esta janela de volta
             INBOX.put({"show": True})
-            return self._send(200, {"ok": True, "app": "PyDM"})
+            return self._send(200, {"ok": True, "app": "Raio"})
         if self.path in ("/media/formats", "/media/download"):
             return self._media()
         if self.path != "/add":
@@ -1351,12 +1351,12 @@ def start_bridge():
 
 
 def already_running():
-    """True se já existe um PyDM rodando (e, nesse caso, pede para ele mostrar a janela)."""
+    """True se já existe um Raio rodando (e, nesse caso, pede para ele mostrar a janela)."""
     try:
         r = urllib.request.Request(f"http://127.0.0.1:{PORT}/show", data=b"{}", method="POST",
                                    headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(r, timeout=1.5) as resp:
-            return json.loads(resp.read()).get("app") == "PyDM"
+            return json.loads(resp.read()).get("app") == "Raio"
     except Exception:
         return False
 
@@ -1365,7 +1365,7 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def autostart_cmd():
-    """Comando gravado no registro: abre o PyDM direto na bandeja."""
+    """Comando gravado no registro: abre o Raio direto na bandeja."""
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}" --tray'
     exe = sys.executable
@@ -1381,7 +1381,7 @@ def autostart_get():
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, "PyDM")
+            winreg.QueryValueEx(k, "Raio")
         return True
     except Exception:
         return False
@@ -1394,10 +1394,10 @@ def autostart_set(on):
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
             if on:
-                winreg.SetValueEx(k, "PyDM", 0, winreg.REG_SZ, autostart_cmd())
+                winreg.SetValueEx(k, "Raio", 0, winreg.REG_SZ, autostart_cmd())
             else:
                 try:
-                    winreg.DeleteValue(k, "PyDM")
+                    winreg.DeleteValue(k, "Raio")
                 except FileNotFoundError:
                     pass
         return True
@@ -1640,7 +1640,7 @@ class InfoDialog:
         p = filedialog.asksaveasfilename(parent=self.win, title="Salvar como",
                                          initialdir=os.path.dirname(cur) or None,
                                          initialfile=os.path.basename(cur),
-                                         confirmoverwrite=False)  # quem pergunta é o PyDM
+                                         confirmoverwrite=False)  # quem pergunta é o Raio
         if p:
             self.path_var.set(os.path.normpath(p))
             self.sync_folder()
@@ -1669,7 +1669,7 @@ class InfoDialog:
 
     def later(self):
         if self.commit(False) and self.app.settings["show_final_later"]:
-            messagebox.showinfo("PyDM", "O download foi adicionado à fila principal.\n"
+            messagebox.showinfo("Raio", "O download foi adicionado à fila principal.\n"
                                         "Use \"Iniciar fila\" quando quiser baixar.", parent=self.app.root)
 
     def cancel(self):
@@ -1704,7 +1704,7 @@ class ShutdownCountdown:
         self.app, self.mode, self.force, self.left = app, mode, force, secs
         self.job = None
         win = self.win = tk.Toplevel(app.root)
-        win.title("PyDM")
+        win.title("Raio")
         win.resizable(False, False)
         win.protocol("WM_DELETE_WINDOW", self.cancel)
         self.var = tk.StringVar()
@@ -1878,7 +1878,7 @@ class ProgressDialog:
         self.cb_modem = ttk.Checkbutton(t, text="Desconectar o modem quando terminar",
                                         variable=self.v_modem, command=self.save_done)
         self.cb_modem.pack(anchor="w", pady=1)
-        self.cb_quit = ttk.Checkbutton(t, text="Sair do PyDM quando terminar",
+        self.cb_quit = ttk.Checkbutton(t, text="Sair do Raio quando terminar",
                                        variable=self.v_quit, command=self.save_done)
         self.cb_quit.pack(anchor="w", pady=1)
         sh = ttk.Frame(t)
@@ -1898,7 +1898,7 @@ class ProgressDialog:
     def refresh_done_state(self):
         show = self.v_msg.get()
         self.v_info.set('Configurações indisponíveis quando "Ver mensagem de download completo" está ativado'
-                        if show else "Ao concluir, o PyDM executará as ações marcadas abaixo (sem mostrar mensagem)")
+                        if show else "Ao concluir, o Raio executará as ações marcadas abaixo (sem mostrar mensagem)")
         for cb in (self.cb_modem, self.cb_quit, self.cb_shut):
             cb.configure(state="disabled" if show else "normal")
         sh_on = (not show) and self.v_shut.get()
@@ -2368,13 +2368,13 @@ class BatchDialog:
         self.win.destroy()
         skipped = len(lines) - len(urls)
         if n == 0:
-            messagebox.showinfo("PyDM", "Todos os endereços já estavam na lista.", parent=self.app.root)
+            messagebox.showinfo("Raio", "Todos os endereços já estavam na lista.", parent=self.app.root)
         else:
             msg = f"{n} download(s) " + ("iniciado(s)." if self.start.get() else "adicionado(s) à fila principal.")
             if skipped:
                 msg += f"\n{skipped} linha(s) sem endereço válido foram ignoradas."
             if self.app.settings["show_final_batch"] or skipped:
-                messagebox.showinfo("PyDM", msg, parent=self.app.root)
+                messagebox.showinfo("Raio", msg, parent=self.app.root)
 
 
 class PropertiesDialog:
@@ -2450,7 +2450,7 @@ class SubDialog:
 
 
 class AddressListDialog(SubDialog):
-    """Lista de endereços (um por linha) que o PyDM não deve baixar automaticamente."""
+    """Lista de endereços (um por linha) que o Raio não deve baixar automaticamente."""
 
     def __init__(self, parent, items, on_ok):
         super().__init__(parent, "Endereços que não devem iniciar o download automaticamente")
@@ -2474,7 +2474,7 @@ class AddressListDialog(SubDialog):
 
 
 class KeysDialog(SubDialog):
-    """Teclas que o usuário segura ao clicar num link para impedir ou forçar a captura pelo PyDM."""
+    """Teclas que o usuário segura ao clicar num link para impedir ou forçar a captura pelo Raio."""
 
     def __init__(self, parent, keys, on_ok):
         super().__init__(parent, "Teclas para impedir/forçar downloads")
@@ -2483,9 +2483,9 @@ class KeysDialog(SubDialog):
         self.v_force = tk.StringVar(value=keys["force"])
         ttk.Label(self.f, justify="left",
                   text="Segure a tecla enquanto clica no link no navegador.\n"
-                       "Funciona com a extensão do PyDM instalada.").pack(anchor="w", pady=(0, 8))
-        for text, var in (("Impedir o PyDM de baixar (o navegador baixa):", self.v_prevent),
-                          ("Forçar o PyDM a baixar (ignora tipos de arquivo e sites excluídos):", self.v_force)):
+                       "Funciona com a extensão do Raio instalada.").pack(anchor="w", pady=(0, 8))
+        for text, var in (("Impedir o Raio de baixar (o navegador baixa):", self.v_prevent),
+                          ("Forçar o Raio a baixar (ignora tipos de arquivo e sites excluídos):", self.v_force)):
             ttk.Label(self.f, text=text).pack(anchor="w", pady=(6, 2))
             ttk.Combobox(self.f, textvariable=var, values=KEY_CHOICES, state="readonly", width=16).pack(anchor="w")
         self.buttons()
@@ -2500,7 +2500,7 @@ class KeysDialog(SubDialog):
 
 
 class ContextMenuDialog(SubDialog):
-    """Quais itens 'Baixar com PyDM' aparecem no menu de clique direito do navegador."""
+    """Quais itens 'Baixar com o Raio' aparecem no menu de clique direito do navegador."""
 
     def __init__(self, parent, menu, title, on_ok):
         super().__init__(parent, "Menu de contexto do navegador")
@@ -2688,10 +2688,10 @@ class ComponentInstaller:
                     self.finished = True
                     self.win.destroy()
                     if ev[1]:
-                        messagebox.showinfo("PyDM", "Componentes instalados.\nOs botões de vídeo já podem baixar.",
+                        messagebox.showinfo("Raio", "Componentes instalados.\nOs botões de vídeo já podem baixar.",
                                             parent=self.app.root)
                     elif ev[2] != "cancelado":
-                        messagebox.showerror("PyDM", f"Não foi possível instalar:\n{ev[2][:300]}", parent=self.app.root)
+                        messagebox.showerror("Raio", f"Não foi possível instalar:\n{ev[2][:300]}", parent=self.app.root)
                     if self.on_done:
                         self.on_done()
                     return
@@ -2703,7 +2703,7 @@ class ComponentInstaller:
 
 
 def extension_dir():
-    """Pasta da extensão do navegador (a que contém o manifest.json): ao lado do PyDM.exe / pydm.py."""
+    """Pasta da extensão do navegador (a que contém o manifest.json): ao lado do Raio.exe / raio.py."""
     base = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
             else os.path.dirname(os.path.abspath(__file__)))
     for p in (os.path.join(base, "extension"), os.path.join(base, "extension", "extension")):
@@ -2739,7 +2739,7 @@ def find_browser(key):
 
 class ExtensionDialog:
     """Passo a passo para instalar a extensão no Chrome/Edge. Os navegadores não deixam um programa instalar
-    extensões sozinho, então o PyDM facilita: abre a página de extensões e mostra a pasta que deve ser carregada."""
+    extensões sozinho, então o Raio facilita: abre a página de extensões e mostra a pasta que deve ser carregada."""
     PAGES = {"chrome": "chrome://extensions", "edge": "edge://extensions"}
 
     def __init__(self, app, on_close=None):
@@ -2755,7 +2755,7 @@ class ExtensionDialog:
         f = ttk.Frame(win, padding=14)
         f.pack(fill="both", expand=True)
         ttk.Label(f, justify="left", wraplength=540,
-                  text="A extensão liga o navegador ao PyDM: captura os downloads e mostra o botão \"Baixar este "
+                  text="A extensão liga o navegador ao Raio: captura os downloads e mostra o botão \"Baixar este "
                        "vídeo\". O Chrome e o Edge não deixam programas instalarem extensões sozinhos, então são "
                        "4 passos rápidos (só na primeira vez):").pack(anchor="w")
 
@@ -2776,13 +2776,13 @@ class ExtensionDialog:
         step(2, "Ative o \"Modo do desenvolvedor\" (chave no canto da página).")
         step(3, "Clique em \"Carregar sem compactação\" (em inglês: \"Load unpacked\").")
         b = step(4, "Na janela que abrir, escolha esta pasta:")
-        self.path_var = tk.StringVar(value=self.path or "Pasta da extensão não encontrada ao lado do PyDM.")
+        self.path_var = tk.StringVar(value=self.path or "Pasta da extensão não encontrada ao lado do Raio.")
         ttk.Entry(b, state="readonly", textvariable=self.path_var, width=62).pack(fill="x", pady=(0, 6))
         ok = "normal" if self.path else "disabled"
         ttk.Button(b, text="Copiar caminho", command=self.copy_path, state=ok).pack(side="left", padx=(0, 8))
         ttk.Button(b, text="Abrir a pasta", command=self.open_folder, state=ok).pack(side="left")
         ttk.Label(f, justify="left", wraplength=540, foreground="#555555",
-                  text="Pronto: o ícone do PyDM aparece na barra do navegador. Ao abrir o Chrome, ele pode avisar sobre "
+                  text="Pronto: o ícone do Raio aparece na barra do navegador. Ao abrir o Chrome, ele pode avisar sobre "
                        "extensões do modo desenvolvedor; é só manter a extensão ativada.").pack(anchor="w", pady=(14, 0))
         ttk.Button(f, text="Fechar", width=14, command=self.close).pack(pady=(12, 0))
         center_front(win)
@@ -2795,7 +2795,7 @@ class ExtensionDialog:
             subprocess.Popen([exe, self.PAGES[key]])
         except Exception as ex:
             log(f"Extensão: não abriu {key}: {ex!r}")
-            messagebox.showerror("PyDM", f"Não foi possível abrir o navegador:\n{ex}", parent=self.win)
+            messagebox.showerror("Raio", f"Não foi possível abrir o navegador:\n{ex}", parent=self.win)
 
     def copy_path(self):
         self.win.clipboard_clear()
@@ -2876,7 +2876,7 @@ class OptionsDialog:
         self.lbl_bridge.pack(side="left")
         ttk.Button(r, text="Reiniciar", command=self.restart_bridge).pack(side="right")
         ttk.Button(r, text="Instalar extensão...", command=lambda: ExtensionDialog(self.app)).pack(side="right", padx=(0, 6))
-        ttk.Checkbutton(lf, text="Iniciar o PyDM automaticamente com o Windows (direto na bandeja)",
+        ttk.Checkbutton(lf, text="Iniciar o Raio automaticamente com o Windows (direto na bandeja)",
                         variable=self.v_auto,
                         state="normal" if sys.platform.startswith("win") else "disabled").pack(anchor="w", pady=(6, 1))
         ttk.Checkbutton(lf, text="Monitorar a área de transferência (perguntar ao copiar um link)",
@@ -2907,8 +2907,8 @@ class OptionsDialog:
         ttk.Button(r, text="Remover", command=self.del_browser).pack(side="right", padx=(6, 0))
         ttk.Button(r, text="Adic. navegador...", command=self.add_browser).pack(side="right")
 
-        for txt, cmd, label in (("Usar teclas para impedir/forçar downloads com o PyDM", self.edit_keys, "Teclas..."),
-                                ("Personalizar o menu de contexto do PyDM no navegador", self.edit_menu, "Editar...")):
+        for txt, cmd, label in (("Usar teclas para impedir/forçar downloads com o Raio", self.edit_keys, "Teclas..."),
+                                ("Personalizar o menu de contexto do Raio no navegador", self.edit_menu, "Editar...")):
             r = ttk.Frame(g)
             r.pack(fill="x", pady=3)
             ttk.Label(r, text=txt).pack(side="left")
@@ -2922,7 +2922,7 @@ class OptionsDialog:
         ok = self.app.restart_bridge()
         self.lbl_bridge.configure(text=self.bridge_text())
         if not ok:
-            messagebox.showwarning("PyDM", f"Não foi possível abrir a porta {PORT}.\n"
+            messagebox.showwarning("Raio", f"Não foi possível abrir a porta {PORT}.\n"
                                            "Feche o outro programa que a usa e tente de novo.", parent=self.win)
 
     def clip_state(self):
@@ -2965,7 +2965,7 @@ class OptionsDialog:
         if not sel:
             return
         if self.browsers[int(sel[0])].get("builtin"):
-            messagebox.showinfo("PyDM", "Só os navegadores adicionados por você podem ser removidos.", parent=self.win)
+            messagebox.showinfo("Raio", "Só os navegadores adicionados por você podem ser removidos.", parent=self.win)
             return
         del self.browsers[int(sel[0])]
         self.fill_browsers()
@@ -3004,7 +3004,7 @@ class OptionsDialog:
         ttk.Button(t, text="Editar lista ...", width=18, command=self.edit_addrs).pack(anchor="w")
         ttk.Label(t, foreground="#555555", justify="left",
                   text="Estes filtros valem para os downloads capturados pelo navegador.\n"
-                       "\"Baixar com PyDM\" (menu de contexto) e a tecla de forçar sempre baixam.\n"
+                       "\"Baixar com o Raio\" (menu de contexto) e a tecla de forçar sempre baixam.\n"
                        "Links sem extensão ou de página dinâmica (ex.: download.php) são capturados."
                   ).pack(anchor="w", pady=(14, 0))
 
@@ -3123,7 +3123,7 @@ class OptionsDialog:
 
     def del_cat(self):
         if not self.cur or self.cur == "Geral" or len(self.cats) <= 1:
-            messagebox.showinfo("PyDM", 'A categoria "Geral" não pode ser excluída.', parent=self.win)
+            messagebox.showinfo("Raio", 'A categoria "Geral" não pode ser excluída.', parent=self.win)
             return
         del self.cats[self.cur]
         self.cur = None
@@ -3211,7 +3211,7 @@ class OptionsDialog:
             ttk.Label(r, text=text, width=28).pack(side="left")
             ttk.Combobox(r, textvariable=var, values=cats, state="readonly", width=20).pack(side="left")
 
-        cf = ttk.LabelFrame(t, text="Componentes (o PyDM usa estes programas para baixar vídeos de sites)", padding=8)
+        cf = ttk.LabelFrame(t, text="Componentes (o Raio usa estes programas para baixar vídeos de sites)", padding=8)
         cf.pack(fill="x", pady=10)
         self.lbl_comp = ttk.Label(cf, justify="left")
         self.lbl_comp.pack(anchor="w")
@@ -3221,7 +3221,7 @@ class OptionsDialog:
             ttk.Label(r, text=text, width=9).pack(side="left")
             ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True)
             ttk.Button(r, text="...", width=3, command=lambda v=var: self.pick_tool(v)).pack(side="left", padx=(6, 0))
-        ttk.Label(cf, text="Em branco = o PyDM procura sozinho (pasta .pydm\\bin ou PATH).",
+        ttk.Label(cf, text="Em branco = o Raio procura sozinho (pasta .pydm\\bin ou PATH).",
                   foreground="#555555").pack(anchor="w", pady=(2, 6))
         r = ttk.Frame(cf)
         r.pack(fill="x")
@@ -3249,17 +3249,17 @@ class OptionsDialog:
 
     def install_components(self):
         if not sys.platform.startswith("win"):
-            messagebox.showinfo("PyDM", "Instale o yt-dlp, o ffmpeg e o Deno pelo gerenciador de pacotes do seu sistema.",
+            messagebox.showinfo("Raio", "Instale o yt-dlp, o ffmpeg e o Deno pelo gerenciador de pacotes do seu sistema.",
                                 parent=self.win)
             return
         missing = [n for n, p in self.tools_now().items() if not p]
         if not missing:
-            if not messagebox.askyesno("PyDM", "Todos os componentes já foram encontrados.\n"
+            if not messagebox.askyesno("Raio", "Todos os componentes já foram encontrados.\n"
                                                "Baixar de novo para atualizar? (cerca de 230 MB)", parent=self.win):
                 return
             missing = ["yt-dlp", "deno", "ffmpeg"]
         sizes = {"yt-dlp": "~20 MB", "deno": "~40 MB", "ffmpeg": "~190 MB"}
-        if messagebox.askyesno("PyDM", "Baixar agora do GitHub:\n\n" +
+        if messagebox.askyesno("Raio", "Baixar agora do GitHub:\n\n" +
                                "\n".join(f"\u2022 {ComponentInstaller.LABEL[n]}  {sizes[n]}" for n in missing),
                                parent=self.win):
             ComponentInstaller(self.app, missing, on_done=self.refresh_components)
@@ -3267,7 +3267,7 @@ class OptionsDialog:
     def update_ytdlp(self):
         tool = self.tools_now()["yt-dlp"]
         if not tool:
-            messagebox.showinfo("PyDM", "O yt-dlp ainda não está instalado. Use \"Instalar / completar componentes\".",
+            messagebox.showinfo("Raio", "O yt-dlp ainda não está instalado. Use \"Instalar / completar componentes\".",
                                 parent=self.win)
             return
 
@@ -3279,7 +3279,7 @@ class OptionsDialog:
             except Exception as ex:
                 TRAY_EVENTS.put(("ytdlp_update", None, str(ex)))
         threading.Thread(target=work, daemon=True).start()
-        messagebox.showinfo("PyDM", "Verificando atualização do yt-dlp... O resultado aparece em instantes.",
+        messagebox.showinfo("Raio", "Verificando atualização do yt-dlp... O resultado aparece em instantes.",
                             parent=self.win)
 
     # ================= aba Velocidade =================
@@ -3377,13 +3377,13 @@ class OptionsDialog:
                 self.v_auto0 = want
                 log("Início automático " + (f"ativado: {autostart_cmd()}" if want else "desativado"))
                 if want:
-                    messagebox.showinfo("PyDM", "Início automático ativado.\n\nComando registrado no Windows:\n"
+                    messagebox.showinfo("Raio", "Início automático ativado.\n\nComando registrado no Windows:\n"
                                                 f"{autostart_cmd()}\n\nNa próxima vez que você entrar no Windows o "
-                                                "PyDM abre na bandeja (perto do relógio; talvez dentro da seta ^).",
+                                                "Raio abre na bandeja (perto do relógio; talvez dentro da seta ^).",
                                         parent=self.win)
             else:
                 self.v_auto.set(self.v_auto0)
-                messagebox.showerror("PyDM", "Não foi possível alterar o início automático com o Windows.\n"
+                messagebox.showerror("Raio", "Não foi possível alterar o início automático com o Windows.\n"
                                              "Detalhes em ~/.pydm/pydm.log.", parent=self.win)
 
         save_cfg(s)
@@ -3434,13 +3434,13 @@ class SchedulerDialog:
         self.v_quit, self.v_shut = tk.BooleanVar(value=sc["quit"]), tk.BooleanVar(value=sc["shutdown"])
         self.v_mode = tk.StringVar(value=sc["mode"] if sc["mode"] in DONE_MODES else DONE_MODES[0])
         self.v_force = tk.BooleanVar(value=sc["force"])
-        ttk.Checkbutton(af, text="Sair do PyDM", variable=self.v_quit).pack(anchor="w")
+        ttk.Checkbutton(af, text="Sair do Raio", variable=self.v_quit).pack(anchor="w")
         r = ttk.Frame(af)
         r.pack(anchor="w", pady=2)
         ttk.Checkbutton(r, text="Desligar o computador", variable=self.v_shut).pack(side="left")
         ttk.Combobox(r, textvariable=self.v_mode, values=DONE_MODES, state="readonly", width=12).pack(side="left", padx=10)
         ttk.Checkbutton(af, text="Forçar o término dos processos", variable=self.v_force).pack(anchor="w", padx=(22, 0))
-        ttk.Label(f, text="O PyDM precisa estar aberto (pode ficar na bandeja) para o agendamento funcionar.",
+        ttk.Label(f, text="O Raio precisa estar aberto (pode ficar na bandeja) para o agendamento funcionar.",
                   foreground="#555555").pack(anchor="w", pady=(6, 0))
 
         bf = ttk.Frame(f)
@@ -3488,7 +3488,7 @@ class SchedulerDialog:
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("PyDM - Gerenciador de Downloads")
+        root.title("Raio Gerenciador de Downloads")
         root.geometry("1080x580")
         root.minsize(780, 380)
         os.makedirs(APP_DIR, exist_ok=True)
@@ -3635,7 +3635,7 @@ class App:
         btn("stopall", "Parar...", ico_hand, self.pause_all, "Parar todos os downloads")
         btn("delete", "Excluir", ico_trash, self.delete_sel, "Excluir o download selecionado")
         btn("delcomp", "Excluir...", ico_trash_ok, self.delete_completed, "Excluir os downloads concluídos")
-        btn("options", "Opções", ico_gear, self.options_dialog, "Opções do PyDM")
+        btn("options", "Opções", ico_gear, self.options_dialog, "Opções do Raio")
         btn("sched", "Agendar", ico_clock, self.scheduler_dialog, "Agendador da fila principal")
         btn("startq", "Iniciar fila", lambda c, x, y, on: ico_queue(c, x, y, on, "start"), self.start_queue,
             "Iniciar a fila principal", menu=lambda: self.queue_menu(True))
@@ -3696,7 +3696,7 @@ class App:
         if self.settings["show_cats"]:
             self.pw.add(self.left, weight=0)
         self.pw.add(self.right, weight=1)
-        # a divisória só pode ser posicionada com a janela já visível e com tamanho real; se o PyDM abre
+        # a divisória só pode ser posicionada com a janela já visível e com tamanho real; se o Raio abre
         # escondido na bandeja (--tray) isso só acontece quando a janela é mostrada pela primeira vez
         self.pw.bind("<Configure>", self._place_sash)
 
@@ -4078,12 +4078,12 @@ class App:
             return
         self._comp_ask = time.time()
         if not sys.platform.startswith("win"):
-            messagebox.showinfo("PyDM", "Para baixar vídeos de sites instale o yt-dlp (e o ffmpeg) pelo gerenciador "
+            messagebox.showinfo("Raio", "Para baixar vídeos de sites instale o yt-dlp (e o ffmpeg) pelo gerenciador "
                                         "de pacotes do seu sistema.", parent=self.root)
             return
         missing = [n for n, p in media_tools_named(self.settings).items() if not p]
         if missing and messagebox.askyesno(
-                "PyDM", "Para baixar vídeos de sites o PyDM precisa instalar alguns componentes do GitHub:\n\n" +
+                "Raio", "Para baixar vídeos de sites o Raio precisa instalar alguns componentes do GitHub:\n\n" +
                 "\n".join(f"\u2022 {ComponentInstaller.LABEL[n]}" for n in missing) +
                 "\n\nBaixar agora? (até ~250 MB, só na primeira vez)", parent=self.root):
             ComponentInstaller(self, missing)
@@ -4342,7 +4342,7 @@ class App:
             c = ""
         urls = [l.strip() for l in c.splitlines() if l.strip().lower().startswith(("http://", "https://"))]
         if not urls:
-            messagebox.showinfo("PyDM", "Não há nenhum endereço (http/https) na área de transferência.",
+            messagebox.showinfo("Raio", "Não há nenhum endereço (http/https) na área de transferência.",
                                 parent=self.root)
         elif len(urls) == 1:
             if self.check_duplicate(urls[0]):
@@ -4355,12 +4355,12 @@ class App:
         items = [d for d in self.items if not isinstance(d, MediaDownload)]   # vídeos do painel dependem do formato escolhido
         skipped = len(self.items) - len(items)
         if not items:
-            messagebox.showinfo("PyDM", "Não há downloads para exportar" +
+            messagebox.showinfo("Raio", "Não há downloads para exportar" +
                                 (" (os vídeos do painel não entram na exportação)." if skipped else "."), parent=self.root)
             return
         p = filedialog.asksaveasfilename(parent=self.root, title="Exportar lista de downloads",
-                                         defaultextension=".json", initialfile="pydm-downloads.json",
-                                         filetypes=[("Lista do PyDM (.json)", "*.json"), ("Só os endereços (.txt)", "*.txt")])
+                                         defaultextension=".json", initialfile="raio-downloads.json",
+                                         filetypes=[("Lista do Raio (.json)", "*.json"), ("Só os endereços (.txt)", "*.txt")])
         if not p:
             return
         try:
@@ -4375,7 +4375,7 @@ class App:
             messagebox.showerror("Erro", f"Não foi possível salvar o arquivo:\n{ex}", parent=self.root)
             return
         if skipped:
-            messagebox.showinfo("PyDM", f"{skipped} vídeo(s) baixados pelo painel da extensão não foram exportados.",
+            messagebox.showinfo("Raio", f"{skipped} vídeo(s) baixados pelo painel da extensão não foram exportados.",
                                 parent=self.root)
 
     def import_list(self):
@@ -4397,7 +4397,7 @@ class App:
             return
         urls = [u.strip() for u in urls if isinstance(u, str) and u.strip().lower().startswith(("http://", "https://"))]
         if not urls:
-            messagebox.showinfo("PyDM", "Nenhum endereço (http/https) encontrado no arquivo.", parent=self.root)
+            messagebox.showinfo("Raio", "Nenhum endereço (http/https) encontrado no arquivo.", parent=self.root)
         else:
             self.batch_dialog(urls)
 
@@ -4423,7 +4423,7 @@ class App:
             return
         d = sel[0]
         if d.status == "Baixando":
-            messagebox.showinfo("PyDM", "Pare o download antes de mover ou renomear o arquivo.", parent=self.root)
+            messagebox.showinfo("Raio", "Pare o download antes de mover ou renomear o arquivo.", parent=self.root)
             return
         cur = d.path or os.path.join(d.folder, d.name or guess_name(d.url))
         new = filedialog.asksaveasfilename(parent=self.root, title="Mover/Renomear", initialdir=os.path.dirname(cur),
@@ -4460,7 +4460,7 @@ class App:
             return
         d = sel[0]
         if d.status == "Baixando":
-            messagebox.showinfo("PyDM", "Pare o download antes de atualizar o endereço.", parent=self.root)
+            messagebox.showinfo("Raio", "Pare o download antes de atualizar o endereço.", parent=self.root)
             return
         u = simpledialog.askstring("Atualizar endereço de download",
                                    "Novo endereço (URL) do arquivo.\nO download continua de onde parou.",
@@ -4503,7 +4503,7 @@ class App:
             self.pending_done.append(dict(d.on_done))
 
     def run_done_actions(self, acts):
-        """Executa as ações "ao concluir". Retorna True se o PyDM foi encerrado."""
+        """Executa as ações "ao concluir". Retorna True se o Raio foi encerrado."""
         if any(a["modem"] for a in acts) and sys.platform.startswith("win"):
             try:
                 subprocess.Popen(["rasdial", "/disconnect"], creationflags=NOWIN)
@@ -4647,7 +4647,7 @@ class App:
         if self.pending_done and not busy:
             acts, self.pending_done = self.pending_done, []
             if self.run_done_actions(acts):
-                return   # o PyDM foi encerrado
+                return   # o Raio foi encerrado
         if int(now) % 3 == 0:
             self.save()
         self.root.after(500, self.tick)
@@ -4685,7 +4685,7 @@ class App:
         if self.settings["clip_auto"]:   # início automático, sem perguntar
             if self.check_duplicate(c):
                 self.add_silent(c, {}, True)
-        elif messagebox.askyesno("PyDM", f"Baixar este link?\n\n{c[:100]}"):
+        elif messagebox.askyesno("Raio", f"Baixar este link?\n\n{c[:100]}"):
             if self.check_duplicate(c):
                 self.open_info(c)
 
@@ -4710,9 +4710,9 @@ class App:
         try:
             import pystray
             menu = pystray.Menu(
-                pystray.MenuItem("Abrir PyDM", lambda icon, item: TRAY_EVENTS.put("show"), default=True),
+                pystray.MenuItem("Abrir o Raio", lambda icon, item: TRAY_EVENTS.put("show"), default=True),
                 pystray.MenuItem("Sair", lambda icon, item: TRAY_EVENTS.put("quit")))
-            self.tray = pystray.Icon("PyDM", make_tray_image(), "PyDM", menu)
+            self.tray = pystray.Icon("Raio", make_tray_image(), "Raio", menu)
             self.tray.run_detached()
         except Exception as ex:
             import traceback
@@ -4755,7 +4755,7 @@ class App:
         if not self.tray or time.time() - self._tray_t < 2:
             return
         self._tray_t = time.time()
-        txt = f"PyDM - {n} ativo(s) - {fmt_size(speed)}/s" if n else "PyDM"
+        txt = f"Raio - {n} ativo(s) - {fmt_size(speed)}/s" if n else "Raio"
         if txt != self._tray_text:
             self._tray_text = txt
             try:
@@ -4776,8 +4776,8 @@ class App:
         if not self.tray_notified:   # avisa uma única vez por sessão
             self.tray_notified = True
             try:
-                self.tray.notify("O PyDM continua em execução na bandeja do sistema.\n"
-                                 "Clique com o botão direito no ícone e escolha Sair para fechar.", "PyDM")
+                self.tray.notify("O Raio continua em execução na bandeja do sistema.\n"
+                                 "Clique com o botão direito no ícone e escolha Sair para fechar.", "Raio")
             except Exception:
                 pass
 
@@ -4792,14 +4792,14 @@ class App:
 
     def close_without_tray(self):
         frozen = getattr(sys, "frozen", False)   # True quando roda como .exe (PyInstaller)
-        head = ("Não foi possível manter o PyDM na bandeja do sistema.\n\n"
+        head = ("Não foi possível manter o Raio na bandeja do sistema.\n\n"
                 f"Motivo: {self.tray_error or 'desconhecido'}\n"
                 f"(detalhes em {os.path.join(APP_DIR, 'pydm.log')})\n\n")
         if self.tray_missing and not frozen:
             r = messagebox.askyesnocancel(
                 "Bandeja indisponível", head +
                 "Deseja instalar agora as bibliotecas necessárias (pystray e pillow)?\n\n"
-                "Sim = instalar e usar a bandeja\nNão = fechar o PyDM\nCancelar = voltar ao programa",
+                "Sim = instalar e usar a bandeja\nNão = fechar o Raio\nCancelar = voltar ao programa",
                 parent=self.root)
             if r is True:
                 self.install_tray_libs()
@@ -4812,7 +4812,7 @@ class App:
         r = messagebox.askyesnocancel(
             "Bandeja indisponível", head + extra +
             "Sim = minimizar para a barra de tarefas (os downloads continuam)\n"
-            "Não = fechar o PyDM\nCancelar = voltar ao programa", parent=self.root)
+            "Não = fechar o Raio\nCancelar = voltar ao programa", parent=self.root)
         if r is True:
             self.root.iconify()
         elif r is False:
@@ -4857,7 +4857,7 @@ class App:
                 return
             messagebox.showwarning("Bandeja indisponível",
                                    "As bibliotecas foram instaladas, mas a bandeja não iniciou:\n"
-                                   f"{self.tray_error}\n\nFeche e abra o PyDM de novo e tente outra vez.",
+                                   f"{self.tray_error}\n\nFeche e abra o Raio de novo e tente outra vez.",
                                    parent=self.root)
         else:
             messagebox.showerror("Falha na instalação",
@@ -4869,7 +4869,7 @@ class App:
         n = sum(1 for d in self.items if d.status in ("Baixando", "Na fila"))
         if n:
             self.show_window()
-            if not messagebox.askyesno("Sair do PyDM",
+            if not messagebox.askyesno("Sair do Raio",
                                        f"Há {n} download(s) em andamento.\n"
                                        "Se sair agora, eles serão pausados (você pode retomar depois).\n\n"
                                        "Sair mesmo assim?", parent=self.root):
@@ -4893,7 +4893,7 @@ class App:
 
 
 def install_components_cli():
-    """PyDM.exe --install-components: chamado pelo instalador (installer.iss) no fim da instalação.
+    """Raio.exe --install-components: chamado pelo instalador (installer.iss) no fim da instalação.
     Abre só a janela de progresso do ComponentInstaller (sem a janela principal) e baixa o que faltar
     em ~/.pydm/bin. Se já estiver tudo instalado, não faz nada."""
     if not sys.platform.startswith("win"):
@@ -4916,7 +4916,7 @@ def install_components_cli():
 
 
 def install_extension_cli():
-    """PyDM.exe --install-extension: chamado pelo instalador (último passo) e pelo menu. Abre só o passo a
+    """Raio.exe --install-extension: chamado pelo instalador (último passo) e pelo menu. Abre só o passo a
     passo de instalação da extensão, sem a janela principal."""
     root = tk.Tk()
     root.withdraw()
@@ -4934,10 +4934,10 @@ if __name__ == "__main__":
     if "--install-extension" in sys.argv:
         install_extension_cli()
         sys.exit(0)
-    if "--install-components" in sys.argv:   # antes do "já está rodando": o instalador pode rodar com o PyDM aberto
+    if "--install-components" in sys.argv:   # antes do "já está rodando": o instalador pode rodar com o Raio aberto
         install_components_cli()
         sys.exit(0)
-    if already_running():   # já existe um PyDM (provavelmente na bandeja): ele mostra a janela
+    if already_running():   # já existe um Raio (provavelmente na bandeja): ele mostra a janela
         sys.exit(0)
     root = tk.Tk()
 
@@ -4945,7 +4945,7 @@ if __name__ == "__main__":
         import traceback
         log("Erro na interface:\n" + "".join(traceback.format_exception(exc, val, tb)))
     root.report_callback_exception = _tk_error
-    log(f"PyDM iniciado (argumentos: {sys.argv[1:]}, executável: {sys.executable})")
+    log(f"Raio iniciado (argumentos: {sys.argv[1:]}, executável: {sys.executable})")
     app = App(root)
     if "--tray" in sys.argv:   # iniciado com o Windows: fica escondido na bandeja
         if app.tray:
@@ -4953,7 +4953,7 @@ if __name__ == "__main__":
 
             def _hello():
                 try:
-                    app.tray.notify("O PyDM foi iniciado e está na bandeja.", "PyDM")
+                    app.tray.notify("O Raio foi iniciado e está na bandeja.", "Raio")
                 except Exception as ex:
                     log(f"Aviso da bandeja: {ex!r}")
             root.after(3000, _hello)
