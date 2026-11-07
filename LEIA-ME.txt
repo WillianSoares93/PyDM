@@ -1,16 +1,37 @@
-COMO GERAR O INSTALADOR (PyDM-Setup.exe)
+COMO GERAR O INSTALADOR (Raio-Setup.exe)
+
+ANTES DE GERAR: a pasta "extension" (a que tem o manifest.json) precisa ficar ao lado do raio.py e do
+installer.iss. O instalador copia essa pasta para {app}\extension.
 
 OPCAO A - No seu PC com Windows (mais rapido)
 1. Instale o Python 3.8+ (marque "Add Python to PATH"): https://python.org
 2. Instale o Inno Setup 6: https://jrsoftware.org/isdl.php
 3. De dois cliques em build.bat
-4. O instalador sera criado em: installer\PyDM-Setup.exe
+4. O instalador sera criado em: installer\Raio-Setup.exe
 
 OPCAO B - Sem instalar nada (GitHub Actions)
 1. Crie um repositorio no GitHub e envie todos os arquivos desta pasta
    (inclusive a pasta .github).
 2. Abra a aba Actions > "Build instalador" e espere terminar.
-3. Baixe o arquivo PyDM-Setup em "Artifacts".
+3. Baixe o arquivo Raio-Setup em "Artifacts".
 
 Obs.: o Windows SmartScreen pode avisar "editor desconhecido", pois o
 executavel nao e assinado digitalmente. Clique em "Mais informacoes" > "Executar assim mesmo".
+
+COMPONENTES DE VIDEO (yt-dlp, Deno e ffmpeg)
+O instalador tem a opcao "Baixar os componentes para baixar videos de sites" (marcada por padrao).
+Ela roda "Raio.exe --install-components", que baixa do GitHub o que faltar para a pasta
+%USERPROFILE%\.pydm\bin (cerca de 250 MB). Se a opcao for desmarcada, ou se outro usuario do
+computador abrir o Raio, ele oferece a instalacao na primeira vez que um video for pedido.
+Para instalar a qualquer momento: Raio.exe --install-components
+
+EXTENSAO DO NAVEGADOR
+O instalador copia a extensao para a pasta do Raio e, na ultima tela, oferece "Instalar a extensao no
+navegador": abre um passo a passo (Raio.exe --install-extension). O Chrome e o Edge nao permitem que
+instaladores coloquem extensoes sozinhos, entao o usuario precisa ativar o "Modo do desenvolvedor" e
+carregar a pasta uma vez. O mesmo passo a passo esta em Tarefas > Instalar extensao do navegador.
+
+AO DESINSTALAR
+O desinstalador fecha o Raio, apaga os componentes de video (%USERPROFILE%\.pydm\bin) e remove o
+"iniciar com o Windows". A lista de downloads e as configuracoes (%USERPROFILE%\.pydm) sao mantidas.
+A extensao continua listada no navegador e deve ser removida la (chrome://extensions).
